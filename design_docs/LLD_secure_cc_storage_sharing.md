@@ -1,6 +1,6 @@
 # Low Level Design: Anonymous Secure Credit Card Storage & Sharing
 
-**Version:** 1.1 — added technology stack (§2.1), JVM tuning (§8.4), and Spring Security scope (§9)
+**Version:** 1.2 — pinned SRP-6a and Argon2id libraries/parameters (§3.1), added interoperability validation requirement (§3.2)
 **Status:** Design finalized, pending implementation
 **Scope:** POC using Google Sheets as RDBMS substitute; production RDBMS swap is a drop-in replacement behind the same data-access interface.
 
@@ -56,6 +56,47 @@
 | Verifier storage | `v = g^H(passkey) mod N` (SRP verifier) | `N` is a 2048-bit+ safe prime; stored alongside ciphertext, never the reverse |
 
 **Prohibited:** storing `hash(passkey)` alone, using passkey directly as AES key without KDF, reusing IVs, custom/home-grown crypto formulas.
+
+### 3.1 Pinned Libraries & Parameters
+
+Library maturity was explicitly verified (not assumed from memory) before pinning, per the design principle in §3 that this is the one component where "well-audited, standard implementation" outweighs convenience. Findings and decisions below.
+
+**SRP-6a:**
+
+| Side | Library | Notes |
+|---|---|---|
+| Backend (Java) | **Nimbus SRP6a** (`com.nimbusds:srp6a`) | RFC 5054-compliant, purpose-built SRP library (narrower scope than Bouncy Castle's general crypto suite, cleaner API for this one job) |
+| Frontend (TS) | **`tssrp6a`** | Dependency-free TypeScript implementation, explicitly built on "Nimbus routines" — the library's own documentation states this compatibility, which is the strongest interoperability signal available short of running our own cross-implementation test vectors (still required — see §3.2). Uses native `BigInt` + `crypto.subtle` (Web Crypto), so it requires HTTPS — already satisfied by this system's transport requirements. |
+| Group parameters | **2048-bit group from RFC 5054, SHA-256 hash** | Both sides must use identical values — this is configured once, referenced by both codebases, never re-derived independently on either side |
+
+*Rejected JS candidates (confirmed stale at time of review):* `secure-remote-password` (npm) — last published 8 years prior to this review; `srp6a` (npm) — last published 6 years prior. Both excluded on maintenance-recency grounds alone, independent of any functional issue.
+
+**Argon2id:**
+
+| Side | Library | Notes |
+|---|---|---|
+| Backend (Java) | **Spring Security Crypto's `Argon2PasswordEncoder`** | Backed by Bouncy Castle internally; avoids pulling in a second crypto dependency if Bouncy Castle is already present for other primitives. Known caveat: this implementation does not exploit the hardware-level parallelism that dedicated cracking tools use, creating a mild defender/attacker asymmetry — accepted as a reasonable tradeoff for a library-maintenance-first choice. |
+| Frontend (browser) | **`argon2id` (OpenPGP.js project)** | WASM-based, explicitly optimized for both performance and bundle size; chosen over older WASM ports (e.g. `argon2-browser`) due to coming from an established, actively maintained applied-cryptography project rather than a lower-activity individual repo |
+
+**Argon2id parameters (pinned, not left as library defaults):**
+
+```
+memory      = 19 MiB   (19456 KiB)
+iterations  = 2
+parallelism = 1
+```
+
+This is the OWASP-cited minimum baseline — deliberately **not** Spring's own out-of-the-box default (`m=4MiB, t=3, p=1`), which sits below the recommended memory cost. These exact values must be identical on both frontend (key derivation for AES) and backend (wherever Argon2id is invoked), and must be treated as a versioned constant — see §3.2.
+
+At `memory=19MiB` and the §8.4 semaphore cap of 3 concurrent operations, worst-case concurrent Argon2id memory usage is ~57MB — comfortable within the 1GB VM budget alongside the ~200MB tuned JVM heap (§8.4).
+
+### 3.2 Interoperability Validation (Required Before Integration)
+
+Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute for verification. Before relying on the cross-language handshake in any integration test:
+
+1. Generate a known test vector — fixed passkey, salt, and challenge — and confirm both the Java (Nimbus) and TypeScript (`tssrp6a`) implementations produce identical intermediate values (`A`, `B`, `S`, `M1`, `M2`) for the same inputs.
+2. Add this as a permanent unit/integration test, not a one-time manual check — protects against a future dependency upgrade silently changing default parameters (e.g. hash function, padding convention) on either side.
+3. Treat the SRP group parameters and Argon2id parameters (§3.1) as versioned constants defined once and imported by both codebases where feasible, rather than hand-copied literals in two places.
 
 ---
 
