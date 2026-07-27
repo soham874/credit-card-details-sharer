@@ -45,6 +45,36 @@ public class Card {
         this.failedAttemptCount = 0;
     }
 
+    public byte[] getEncryptedCcBlob() {
+        return encryptedCcBlob.clone();
+    }
+
+    public String getSrpVerifier() {
+        return srpVerifier;
+    }
+
+    public String getSrpSalt() {
+        return srpSalt;
+    }
+
+    public boolean isLocked(Instant now) {
+        return lockedUntil != null && lockedUntil.isAfter(now);
+    }
+
+    public void resetFailedAttempts() {
+        failedAttemptCount = 0;
+        lockedUntil = null;
+    }
+
+    public void recordFailedAttempt(Instant now, int maximumAttempts, java.time.Duration lockoutDuration) {
+        if (failedAttemptCount < Short.MAX_VALUE) {
+            failedAttemptCount++;
+        }
+        if (failedAttemptCount >= maximumAttempts) {
+            lockedUntil = now.plus(lockoutDuration);
+        }
+    }
+
     @PrePersist
     void initializeCreatedAt() {
         if (createdAt == null) {
