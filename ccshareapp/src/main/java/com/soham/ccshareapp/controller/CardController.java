@@ -37,14 +37,14 @@ public class CardController {
     @PostMapping("/fetch")
     public Object fetch(@RequestBody JsonNode request) {
         if (request.hasNonNull("card_identifier") && request.size() == 1) {
-            return cardFetchService.initiate(new FetchInitiateRequest(request.path("card_identifier").asText()));
+            return cardFetchService.initiate(new FetchInitiateRequest(request.path("card_identifier").asString()));
         }
         if (request.hasNonNull("challenge_id") && request.hasNonNull("client_public_ephemeral")
                 && request.hasNonNull("client_proof") && request.size() == 3) {
             return cardFetchService.prove(new FetchProofRequest(
-                    request.path("challenge_id").asText(),
-                    request.path("client_public_ephemeral").asText(),
-                    request.path("client_proof").asText()));
+                    request.path("challenge_id").asString(),
+                    request.path("client_public_ephemeral").asString(),
+                    request.path("client_proof").asString()));
         }
         throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid fetch request");
     }

@@ -83,9 +83,9 @@ class CardFlowIntegrationTests {
                 .getResponse()
                 .getContentAsString();
         JsonNode challenge = objectMapper.readTree(challengeBody);
-        String challengeId = challenge.required("challenge_id").asText();
-        String returnedSalt = challenge.required("srp_salt").asText();
-        BigInteger serverPublicEphemeral = parseHex(challenge.required("server_public_ephemeral").asText());
+        String challengeId = challenge.required("challenge_id").asString();
+        String returnedSalt = challenge.required("srp_salt").asString();
+        BigInteger serverPublicEphemeral = parseHex(challenge.required("server_public_ephemeral").asString());
         assertEquals(srpSaltHex, returnedSalt);
 
         SRP6ClientSession clientSession = new SRP6ClientSession();
@@ -105,8 +105,8 @@ class CardFlowIntegrationTests {
                 .getResponse()
                 .getContentAsString();
         JsonNode fetchResult = objectMapper.readTree(proofBody);
-        String encryptedBlob = fetchResult.required("encrypted_cc_blob").asText();
-        String serverProof = fetchResult.required("server_proof").asText();
+        String encryptedBlob = fetchResult.required("encrypted_cc_blob").asString();
+        String serverProof = fetchResult.required("server_proof").asString();
         assertNotNull(serverProof);
         clientSession.step3(parseHex(serverProof));
 
