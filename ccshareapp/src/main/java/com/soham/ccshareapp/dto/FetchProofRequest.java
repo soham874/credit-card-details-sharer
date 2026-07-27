@@ -1,4 +1,4 @@
-package com.soham.ccshareapp.card;
+package com.soham.ccshareapp.dto;
 
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;

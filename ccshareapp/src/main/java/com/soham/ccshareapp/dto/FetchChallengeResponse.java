@@ -1,4 +1,4 @@
-package com.soham.ccshareapp.card;
+package com.soham.ccshareapp.dto;
 
 public record FetchChallengeResponse(
         String challenge_id,

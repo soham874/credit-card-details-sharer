@@ -1,4 +1,6 @@
-package com.soham.ccshareapp.card;
+package com.soham.ccshareapp.repository;
+
+import com.soham.ccshareapp.model.Card;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 

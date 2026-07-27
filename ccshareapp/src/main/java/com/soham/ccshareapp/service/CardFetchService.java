@@ -1,4 +1,11 @@
-package com.soham.ccshareapp.card;
+package com.soham.ccshareapp.service;
+
+import com.soham.ccshareapp.dto.FetchCardResponse;
+import com.soham.ccshareapp.dto.FetchChallengeResponse;
+import com.soham.ccshareapp.dto.FetchInitiateRequest;
+import com.soham.ccshareapp.dto.FetchProofRequest;
+import com.soham.ccshareapp.model.Card;
+import com.soham.ccshareapp.repository.CardRepository;
 
 import java.math.BigInteger;
 import java.security.SecureRandom;

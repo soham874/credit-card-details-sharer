@@ -1,4 +1,4 @@
-package com.soham.ccshareapp.card;
+package com.soham.ccshareapp.model;
 
 import java.time.Instant;
 

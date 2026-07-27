@@ -1,4 +1,8 @@
-package com.soham.ccshareapp.card;
+package com.soham.ccshareapp.service;
+
+import com.soham.ccshareapp.dto.CreateCardRequest;
+import com.soham.ccshareapp.model.Card;
+import com.soham.ccshareapp.repository.CardRepository;
 
 import java.util.Base64;
 import java.util.UUID;
