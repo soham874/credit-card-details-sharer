@@ -6,7 +6,7 @@
       <version>25</version>
     </provides>
     <configuration>
-      <jdkHome>/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home</jdkHome>
+      <jdkHome>/Users/sohamchoudhury/Library/Java/JavaVirtualMachines/loom-ea-25-loom+1-11/Contents/Home</jdkHome>
     </configuration>
   </toolchain>
 </toolchains>

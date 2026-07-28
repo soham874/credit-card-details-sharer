@@ -110,6 +110,7 @@ Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute fo
 | `encrypted_cc_blob` | string (base64) | IV \|\| ciphertext \|\| AEAD tag, bundled |
 | `srp_verifier` | string (hex) | SRP verifier `v`, computed client-side at creation |
 | `srp_salt` | string (hex) | Per-record salt, used in SRP key derivation |
+| `card_label` | string (plaintext, ≤100 chars) | User-chosen nickname (e.g. "HDFC Platinum") so the frontend can show *which* card is being unlocked before the passkey is entered. Stored and returned in cleartext — see §4.3 for why this is safe. Never derived/auto-populated from decrypted card data; always user-typed at `/create` time. |
 | `created_at` | timestamp | |
 | `failed_attempt_count` | integer | Shared counter across `/fetch` and `/authLink` (§6.4) |
 | `locked_until` | timestamp, nullable | Lockout expiry, if triggered |
@@ -124,6 +125,25 @@ Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute fo
 
 ---
 
+## 4.3 `card_label` — Human-Readable Card Selection
+
+There is no account/login concept in this system, so there is no "my cards" list a user can browse. Each stored card is reachable only via its own link. With more than one card saved, the user needs a way to tell them apart *before* authenticating (e.g. "is this my HDFC card or my ICICI card?") — the `card_identifier` alone is an opaque UUID and useless for that.
+
+`card_label` solves this as plaintext, user-chosen metadata:
+- Supplied by the client at `/create` time, alongside the encrypted blob — never derived from, or auto-populated from, decrypted card data.
+- Stored in cleartext (`VARCHAR(100)`) next to the ciphertext — analogous to `srp_salt`, which is also stored unencrypted because it isn't secret on its own.
+- Returned by `/fetch` step 1 (§5.2) so the frontend can render "Enter passkey for **HDFC Platinum**" before the user types anything.
+
+**Why plaintext is safe here:** the label is a nickname the user typed, not data extracted from the card. It carries no more information than "this row exists" — which anyone holding the 122-bit random `card_identifier` already knows. It never contains the card number, expiry, CVV, or anything derived from them. Security still rests entirely on the passkey; the label adds no attack surface beyond what possessing the identifier already implies (see §6.5).
+
+**Constraints:** `NOT NULL`, max 100 characters, sanitized/length-checked at the API boundary. The frontend must HTML-escape it on render (it is untrusted user input, displayed back to the same or a different user in the Share flow) — this is a rendering-layer responsibility, not something the backend can guarantee by storing it.
+
+**Indistinguishability:** per §6.3, the `/fetch` step-1 response shape must not reveal whether `card_identifier` exists. When the identifier is not found, the server returns a fixed placeholder label rather than omitting the field, so response shape stays identical in both cases.
+
+**Scope note:** as of this revision, `card_label` is implemented for the `/create` and `/fetch` flows only. The Share flow (§5.4–5.7) does not yet expose it to the receiver; that is a follow-up item, not a decided exclusion.
+
+---
+
 ## 5. API Contracts
 
 ### 5.1 `POST /create`
@@ -133,13 +153,15 @@ Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute fo
   "card_identifier": "string (client-generated, high-entropy)",
   "encrypted_cc_blob": "base64 string (IV+ciphertext+tag)",
   "srp_verifier": "hex string",
-  "srp_salt": "hex string"
+  "srp_salt": "hex string",
+  "card_label": "string (user-chosen nickname, ≤100 chars)"
 }
 ```
 **Response:** `200 OK` — no body needed beyond ack.
 
 **Server behavior:**
 - Validate `card_identifier` uniqueness and entropy (reject low-entropy/predictable identifiers if self-issued — recommend server-generated identifiers instead, returned in response, to remove client trust dependency).
+- Validate `card_label` is non-blank and ≤100 characters. No entropy/content requirement — it's a cosmetic nickname, not a security-relevant field.
 - Persist all fields verbatim. Server performs **no decryption, no derivation** — it is a blind store at this step.
 - Sanitize any string field before writing to Google Sheets (CSV/formula-injection guard — prefix-escape leading `=`, `+`, `-`, `@`).
 
@@ -156,12 +178,13 @@ Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute fo
 {
   "challenge_id": "string",
   "srp_salt": "hex",
-  "server_public_ephemeral": "hex (B)"
+  "server_public_ephemeral": "hex (B)",
+  "card_label": "string"
 }
 ```
 **Server behavior:**
 - Check `locked_until` — if in lockout window, return generic `403` (same shape as invalid-identifier response, see §6.5).
-- Look up `srp_verifier` + `srp_salt` for `card_identifier`. If not found, still generate a plausible-looking dummy challenge (constant-time behavior — see §6.5) rather than short-circuiting.
+- Look up `srp_verifier` + `srp_salt` + `card_label` for `card_identifier`. If not found, still generate a plausible-looking dummy challenge and a fixed placeholder `card_label` (constant-time behavior, identical response shape — see §6.5) rather than short-circuiting.
 - Generate SRP server ephemeral (`b`, `B`); store `b` against `challenge_id` in Ephemeral Storage with 2-minute TTL, single-use.
 - **No card data touched yet.**
 

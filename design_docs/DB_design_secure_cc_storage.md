@@ -29,6 +29,7 @@ Primary record store. Backend never decrypts or derives anything from this table
 | `encrypted_cc_blob` | `VARBINARY(512)` | `NOT NULL` | IV \|\| ciphertext \|\| AEAD tag, raw bytes. Sized generously for AES-256-GCM overhead on card-sized plaintext. |
 | `srp_verifier` | `VARCHAR(512)` | `NOT NULL` | Hex string; sized for a 2048-bit+ SRP group. |
 | `srp_salt` | `VARCHAR(64)` | `NOT NULL` | Hex, fixed length per KDF config. |
+| `card_label` | `VARCHAR(100)` | `NOT NULL` | Plaintext, user-chosen nickname (e.g. "HDFC Platinum"). Lets the frontend show which card is being unlocked before the passkey is entered — there's no account/listing concept to browse cards any other way. Safe to store unencrypted: it's a name the user typed, never derived from card data, and no more revealing than the fact that the row exists (LLD §4.3). |
 | `created_at` | `TIMESTAMP` | `NOT NULL DEFAULT CURRENT_TIMESTAMP` | |
 | `failed_attempt_count` | `SMALLINT UNSIGNED` | `NOT NULL DEFAULT 0` | Shared counter across `/fetch` and `/share/authLink` (LLD §6.4). Reset to 0 on successful proof. |
 | `locked_until` | `TIMESTAMP` | `NULL DEFAULT NULL` | Lockout expiry. `NULL` = not locked. Lives on the record itself so lockout state survives restarts of any rate-limiting middleware. |
@@ -43,12 +44,15 @@ CREATE TABLE cards (
     encrypted_cc_blob    VARBINARY(512)      NOT NULL,
     srp_verifier         VARCHAR(512)        NOT NULL,
     srp_salt             VARCHAR(64)         NOT NULL,
+    card_label           VARCHAR(100)        NOT NULL,
     created_at           TIMESTAMP           NOT NULL DEFAULT CURRENT_TIMESTAMP,
     failed_attempt_count SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
     locked_until          TIMESTAMP           NULL DEFAULT NULL,
     PRIMARY KEY (card_identifier)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 ```
+
+**Migration note (`V2__add_card_label.sql`):** adds `card_label` to an existing `cards` table via `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ''`, then drops the default. This is a POC-stage convenience — there is no production data to backfill — and lets the column land as `NOT NULL` without a separate backfill step.
 
 > `utf8mb4_bin` over `utf8mb4_unicode_ci`: identifiers and hex/binary fields need exact byte-equality comparisons, not linguistic sorting. A case-insensitive collation could quietly treat two distinct identifiers as equal.
 

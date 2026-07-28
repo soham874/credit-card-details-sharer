@@ -139,16 +139,7 @@ The runtime requires the `mysql` Spring profile.
 ### macOS
 
 ```bash
-./mvnw clean package
-
-/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home/bin/java \
-  -Xmx200m \
-  -Xms100m \
-  -Xss256k \
-  -XX:MaxMetaspaceSize=100m \
-  -XX:+UseSerialGC \
-  -jar target/ccshareapp-0.0.1-SNAPSHOT.jar \
-  --spring.profiles.active=mysql
+ mvn clean package && java -Xmx200m -Xms100m -Xss256k -XX:MaxMetaspaceSize=100m -XX:+UseSerialGC -jar target/ccshareapp-0.0.1-SNAPSHOT.jar --spring.profiles.active=mysql
 ```
 
 ### Windows PowerShell
@@ -207,6 +198,7 @@ Required request fields:
 - `encrypted_cc_blob`: Base64-encoded encrypted bytes
 - `srp_verifier`: hexadecimal SRP verifier
 - `srp_salt`: hexadecimal SRP salt
+- `card_label`: user-chosen nickname for the card (e.g. `"HDFC Platinum"`), max 100 characters. Stored and returned in cleartext so the frontend can show which card is being unlocked before the passkey is entered — see LLD §4.3.
 
 Example:
 
@@ -217,8 +209,60 @@ curl --request POST http://localhost:8080/create \
     "card_identifier": "550e8400-e29b-41d4-a716-446655440000",
     "encrypted_cc_blob": "AAECAwQFBgcICQ==",
     "srp_verifier": "a1b2c3d4",
-    "srp_salt": "e5f6a7b8"
+    "srp_salt": "e5f6a7b8",
+    "card_label": "HDFC Platinum"
   }'
 ```
 
 A successful request returns `200 OK` with no body. Invalid input returns `400 Bad Request`; duplicate card identifiers return `409 Conflict`.
+
+## Logging
+
+Logging is configured via `logback-spring.xml` with both INFO and DEBUG levels:
+
+### Log Levels
+
+- **INFO:** Business-critical events (card created, fetch initiated, proof verified, lockout triggered)
+- **DEBUG:** Detailed flow information (validation steps, challenge generation, state transitions)
+
+### Log Output
+
+- **Console:** Real-time log output during development
+- **File:** Rotating log file at `spring.log` (10MB per file, 30-day history)
+
+### Security Note (LLD §6.7)
+
+The logging system intentionally **never logs:**
+- Passphrases or passkeys
+- SRP proofs (M1, M2, session key S)
+- Encrypted CC blob contents
+- Decrypted plaintext card data
+
+Safe to log:
+- Card identifiers and labels
+- Failed attempt counts and lockout state
+- Validation results and error types
+- Request/response metadata (size, timing)
+
+### Configure Log Level
+
+Set the `LOG_LEVEL` environment variable or edit `logback-spring.xml`:
+
+```yaml
+# In application.yaml or application-mysql.yaml
+logging:
+  level:
+    com.soham.ccshareapp: DEBUG
+    org.springframework.web: DEBUG
+```
+
+### View Logs
+
+```bash
+# Console output during runtime (already in use)
+# File-based logs
+tail -f spring.log
+
+# Filter by logger
+grep "CardFetchService" spring.log
+```

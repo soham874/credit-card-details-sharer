@@ -54,6 +54,122 @@ class CardFlowIntegrationTests {
     }
 
     @Test
+    void lockoutCardAfterExcessiveFailedAttempts() throws Exception {
+        String cardIdentifier = java.util.UUID.randomUUID().toString();
+        String correctPasskey = "correct-passkey";
+        String wrongPasskey = "wrong-passkey";
+        String cardDetails = "{\"cardNumber\":\"4111111111111111\",\"expiry\":\"12/30\",\"cvv\":\"123\",\"pin\":\"1234\"}";
+        byte[] srpSalt = randomBytes(16);
+        String srpSaltHex = HexFormat.of().formatHex(srpSalt);
+
+        byte[] encryptedCardBlob = encryptInBrowser(cardDetails, correctPasskey, srpSalt);
+        BigInteger verifier = new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
+                .generateVerifier(new BigInteger(1, srpSalt), cardIdentifier, correctPasskey);
+        String createPayload = objectMapper.writeValueAsString(new CreatePayload(
+                cardIdentifier,
+                Base64.getEncoder().encodeToString(encryptedCardBlob),
+                verifier.toString(16),
+                srpSaltHex,
+                "Test Card"));
+
+        mockMvc.perform(post("/create")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(createPayload))
+                .andExpect(status().isOk());
+
+        // Make 5 failed attempts (MAX_FAILED_ATTEMPTS = 5) to trigger lockout
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            String challengeBody = mockMvc.perform(post("/fetch")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(new InitiateFetchPayload(cardIdentifier))))
+                    .andExpect(status().isOk())
+                    .andReturn()
+                    .getResponse()
+                    .getContentAsString();
+            JsonNode challenge = objectMapper.readTree(challengeBody);
+            String challengeId = challenge.required("challenge_id").asString();
+            BigInteger serverPublicEphemeral = parseHex(challenge.required("server_public_ephemeral").asString());
+
+            SRP6ClientSession clientSession = new SRP6ClientSession();
+            clientSession.step1(cardIdentifier, wrongPasskey);
+            SRP6ClientCredentials credentials = clientSession.step2(
+                    SRP_CRYPTO_PARAMS,
+                    parseHex(challenge.required("srp_salt").asString()),
+                    serverPublicEphemeral);
+
+            mockMvc.perform(post("/fetch")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(new FetchProofPayload(
+                                    challengeId,
+                                    credentials.A.toString(16),
+                                    credentials.M1.toString(16)))))
+                    .andExpect(status().isForbidden());
+        }
+
+        // After 5 failed attempts, card is locked. Next fetch initiate must fail with 403 (not 200).
+        mockMvc.perform(post("/fetch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new InitiateFetchPayload(cardIdentifier))))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void rejectsInvalidSRPProofWithWrongPasskey() throws Exception {
+        String cardIdentifier = java.util.UUID.randomUUID().toString();
+        String correctPasskey = "correct-passkey-kept-in-browser-memory";
+        String wrongPasskey = "wrong-passkey-different";
+        String cardDetails = "{\"cardNumber\":\"4111111111111111\",\"expiry\":\"12/30\",\"cvv\":\"123\",\"pin\":\"1234\"}";
+        byte[] srpSalt = randomBytes(16);
+        String srpSaltHex = HexFormat.of().formatHex(srpSalt);
+
+        byte[] encryptedCardBlob = encryptInBrowser(cardDetails, correctPasskey, srpSalt);
+        BigInteger verifier = new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
+                .generateVerifier(new BigInteger(1, srpSalt), cardIdentifier, correctPasskey);
+        String cardLabel = "HDFC Platinum";
+        String createPayload = objectMapper.writeValueAsString(new CreatePayload(
+                cardIdentifier,
+                Base64.getEncoder().encodeToString(encryptedCardBlob),
+                verifier.toString(16),
+                srpSaltHex,
+                cardLabel));
+
+        mockMvc.perform(post("/create")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(createPayload))
+                .andExpect(status().isOk());
+
+        // Initiate fetch (step 1) — this should work with correct card_identifier
+        String challengeBody = mockMvc.perform(post("/fetch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new InitiateFetchPayload(cardIdentifier))))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        JsonNode challenge = objectMapper.readTree(challengeBody);
+        String challengeId = challenge.required("challenge_id").asString();
+        String returnedSalt = challenge.required("srp_salt").asString();
+        BigInteger serverPublicEphemeral = parseHex(challenge.required("server_public_ephemeral").asString());
+
+        // Client tries to prove with WRONG passkey
+        SRP6ClientSession clientSession = new SRP6ClientSession();
+        clientSession.step1(cardIdentifier, wrongPasskey); // Using wrong passkey
+        SRP6ClientCredentials credentials = clientSession.step2(
+                SRP_CRYPTO_PARAMS,
+                parseHex(returnedSalt),
+                serverPublicEphemeral);
+
+        // Proof submission with wrong passkey should fail with 403
+        mockMvc.perform(post("/fetch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new FetchProofPayload(
+                                challengeId,
+                                credentials.A.toString(16),
+                                credentials.M1.toString(16)))))
+                .andExpect(status().isForbidden());
+    }
+
+    @Test
     void createsAndFetchesAnEncryptedCardThroughTheFrontendFlow() throws Exception {
         String cardIdentifier = java.util.UUID.randomUUID().toString();
         String passkey = "test-passkey-kept-in-browser-memory";
@@ -64,11 +180,13 @@ class CardFlowIntegrationTests {
         byte[] encryptedCardBlob = encryptInBrowser(cardDetails, passkey, srpSalt);
         BigInteger verifier = new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
                 .generateVerifier(new BigInteger(1, srpSalt), cardIdentifier, passkey);
+        String cardLabel = "HDFC Platinum";
         String createPayload = objectMapper.writeValueAsString(new CreatePayload(
                 cardIdentifier,
                 Base64.getEncoder().encodeToString(encryptedCardBlob),
                 verifier.toString(16),
-                srpSaltHex));
+                srpSaltHex,
+                cardLabel));
 
         mockMvc.perform(post("/create")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -87,6 +205,7 @@ class CardFlowIntegrationTests {
         String returnedSalt = challenge.required("srp_salt").asString();
         BigInteger serverPublicEphemeral = parseHex(challenge.required("server_public_ephemeral").asString());
         assertEquals(srpSaltHex, returnedSalt);
+        assertEquals(cardLabel, challenge.required("card_label").asString());
 
         SRP6ClientSession clientSession = new SRP6ClientSession();
         clientSession.step1(cardIdentifier, passkey);
@@ -154,7 +273,7 @@ class CardFlowIntegrationTests {
         return new BigInteger(1, HexFormat.of().parseHex(normalizedValue));
     }
 
-    private record CreatePayload(String card_identifier, String encrypted_cc_blob, String srp_verifier, String srp_salt) {
+    private record CreatePayload(String card_identifier, String encrypted_cc_blob, String srp_verifier, String srp_salt, String card_label) {
     }
 
     private record InitiateFetchPayload(String card_identifier) {

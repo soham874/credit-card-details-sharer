@@ -8,5 +8,6 @@ public record CreateCardRequest(
         @NotBlank @Pattern(regexp = "^[0-9a-fA-F-]{36}$") String card_identifier,
         @NotBlank @Size(max = 684) String encrypted_cc_blob,
         @NotBlank @Size(max = 512) @Pattern(regexp = "^[0-9a-fA-F]+$") String srp_verifier,
-        @NotBlank @Size(max = 64) @Pattern(regexp = "^[0-9a-fA-F]+$") String srp_salt) {
+        @NotBlank @Size(max = 64) @Pattern(regexp = "^[0-9a-fA-F]+$") String srp_salt,
+        @NotBlank @Size(max = 100) String card_label) {
 }

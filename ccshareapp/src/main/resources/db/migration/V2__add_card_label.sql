@@ -1,0 +1,5 @@
+ALTER TABLE cards
+    ADD COLUMN card_label VARCHAR(100) NOT NULL DEFAULT '' AFTER srp_salt;
+
+ALTER TABLE cards
+    ALTER COLUMN card_label DROP DEFAULT;
