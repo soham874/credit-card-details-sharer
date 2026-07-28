@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Card identifiers travel in the URL fragment; never leak a URL to a third party. -->
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta
+      name="description"
+      content="Store and retrieve credit card details that are encrypted in your browser and never readable by the server."
+    />
+    <title>Card Vault — client-side encrypted card storage</title>
+    <!-- The production CSP is injected here at build time; see vite.config.ts. -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
