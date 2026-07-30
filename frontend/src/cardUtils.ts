@@ -124,8 +124,17 @@ export function maskCardNumber(cardNumber: string): string {
 
 /**
  * Rough passkey strength, used to enforce a floor at creation time
- * (LLD §7, §10.5). This is a heuristic for UX nudging, not an entropy proof —
- * the real defence is Argon2id/PBKDF2 cost plus the server-side lockout.
+ * (LLD §7, §10.5). A heuristic for UX nudging, not an entropy proof.
+ *
+ * The bar sits higher than it used to because the passkey now carries more of
+ * the weight. Card identifiers are derived from it, so a wrong passkey addresses
+ * a card that does not exist rather than failing a proof against the real one —
+ * which means the per-card lockout no longer bounds online guessing, and PBKDF2
+ * cost plus per-IP rate limiting (LLD §6.1) is what remains.
+ *
+ * This runs in the browser and cannot be enforced anywhere else: `/create` never
+ * receives the passkey, by design (LLD §1.1, §9.2), so the server has nothing to
+ * check. Anyone bypassing this weakens only their own card.
  */
 export type PasskeyStrength = {
   score: 0 | 1 | 2 | 3 | 4;
@@ -134,7 +143,7 @@ export type PasskeyStrength = {
   hint: string;
 };
 
-const MIN_PASSKEY_LENGTH = 12;
+const MIN_PASSKEY_LENGTH = 16;
 
 export function ratePasskey(passkey: string): PasskeyStrength {
   if (!passkey) {
@@ -150,20 +159,22 @@ export function ratePasskey(passkey: string): PasskeyStrength {
   if (passkey.length >= 8) score++;
   if (passkey.length >= MIN_PASSKEY_LENGTH) score++;
   if (classes >= 3) score++;
-  if (passkey.length >= 16 && unique >= 10) score++;
+  if (passkey.length >= MIN_PASSKEY_LENGTH && unique >= 10) score++;
 
   // A long string of one repeated character passes the length checks but is
   // trivially guessable, so cap it.
   if (unique <= 4) score = Math.min(score, 1);
 
   const tooShort = passkey.length < MIN_PASSKEY_LENGTH;
-  const acceptable = !tooShort && score >= 2;
+  // Length alone gets a passkey to 2. Clearing 3 means it also has to bring
+  // either mixed character types or a genuinely varied set of characters.
+  const acceptable = !tooShort && score >= 3;
 
   const hint = tooShort
     ? `Use at least ${MIN_PASSKEY_LENGTH} characters.`
     : acceptable
       ? ""
-      : "Mix upper case, lower case, digits, and symbols.";
+      : "Too repetitive. Mix upper case, lower case, digits, and symbols, or use more distinct characters.";
 
   return {
     score: Math.min(score, 4) as PasskeyStrength["score"],
@@ -172,8 +183,6 @@ export function ratePasskey(passkey: string): PasskeyStrength {
     hint,
   };
 }
-
-export const PASSKEY_MIN_LENGTH = MIN_PASSKEY_LENGTH;
 
 /** Backend requires a UUIDv4 for both `card_identifier` and `challenge_id`. */
 export function isUuidV4(value: string): boolean {

@@ -1,6 +1,6 @@
 # Low Level Design: Anonymous Secure Credit Card Storage & Sharing
 
-**Version:** 1.2 — pinned SRP-6a and Argon2id libraries/parameters (§3.1), added interoperability validation requirement (§3.2)
+**Version:** 1.3 — card identifiers are now derived client-side from the card name, its last four digits, and the passkey (§4.3); `card_label` dropped and folded into the ciphertext (§4.1, §5.1, §5.2); consequences for lockout (§6.2, §6.4), identifier handling (§6.5, §6.7), and deep links (§8.2)
 **Status:** Design finalized, pending implementation
 **Scope:** POC using Google Sheets as RDBMS substitute; production RDBMS swap is a drop-in replacement behind the same data-access interface.
 
@@ -106,11 +106,10 @@ Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute fo
 
 | Field | Type | Notes |
 |---|---|---|
-| `card_identifier` | string (UUIDv4 or 128-bit random token) | Primary key. **Must not be sequential or guessable.** |
-| `encrypted_cc_blob` | string (base64) | IV \|\| ciphertext \|\| AEAD tag, bundled |
+| `card_identifier` | string (UUIDv4 shape) | Primary key. **Must not be sequential or guessable.** Derived client-side — see §4.3. |
+| `encrypted_cc_blob` | string (base64) | IV \|\| ciphertext \|\| AEAD tag, bundled. Carries the card's nickname alongside the card data (§4.3). |
 | `srp_verifier` | string (hex) | SRP verifier `v`, computed client-side at creation |
 | `srp_salt` | string (hex) | Per-record salt, used in SRP key derivation |
-| `card_label` | string (plaintext, ≤100 chars) | User-chosen nickname (e.g. "HDFC Platinum") so the frontend can show *which* card is being unlocked before the passkey is entered. Stored and returned in cleartext — see §4.3 for why this is safe. Never derived/auto-populated from decrypted card data; always user-typed at `/create` time. |
 | `created_at` | timestamp | |
 | `failed_attempt_count` | integer | Shared counter across `/fetch` and `/authLink` (§6.4) |
 | `locked_until` | timestamp, nullable | Lockout expiry, if triggered |
@@ -125,22 +124,42 @@ Pinning a "Nimbus-compatible" JS library is a strong signal, not a substitute fo
 
 ---
 
-## 4.3 `card_label` — Human-Readable Card Selection
+## 4.3 Derived Card Identifiers
 
-There is no account/login concept in this system, so there is no "my cards" list a user can browse. Each stored card is reachable only via its own link. With more than one card saved, the user needs a way to tell them apart *before* authenticating (e.g. "is this my HDFC card or my ICICI card?") — the `card_identifier` alone is an opaque UUID and useless for that.
+There is no account/login concept in this system, so there is no "my cards" list a user can browse. The original design answered "how does a user find their card again?" by handing them the `card_identifier` — a random UUID — and requiring them to keep it somewhere and paste it back. That is a bad answer: it makes the user the storage layer for a 36-character opaque string, and losing it destroys the card as surely as losing the passkey.
 
-`card_label` solves this as plaintext, user-chosen metadata:
-- Supplied by the client at `/create` time, alongside the encrypted blob — never derived from, or auto-populated from, decrypted card data.
-- Stored in cleartext (`VARCHAR(100)`) next to the ciphertext — analogous to `srp_salt`, which is also stored unencrypted because it isn't secret on its own.
-- Returned by `/fetch` step 1 (§5.2) so the frontend can render "Enter passkey for **HDFC Platinum**" before the user types anything.
+The identifier is instead **derived in the browser** from three things the user knows or is holding:
 
-**Why plaintext is safe here:** the label is a nickname the user typed, not data extracted from the card. It carries no more information than "this row exists" — which anyone holding the 122-bit random `card_identifier` already knows. It never contains the card number, expiry, CVV, or anything derived from them. Security still rests entirely on the passkey; the label adds no attack surface beyond what possessing the identifier already implies (see §6.5).
+```
+card_identifier = uuidV4Shape(
+    PBKDF2-SHA256(
+        password   = passkey,
+        salt       = "ccshare-id-v1|" || normalize(card_name) || "|" || last4,
+        iterations = 600_000,
+        dkLen      = 16 bytes))
+```
 
-**Constraints:** `NOT NULL`, max 100 characters, sanitized/length-checked at the API boundary. The frontend must HTML-escape it on render (it is untrusted user input, displayed back to the same or a different user in the Share flow) — this is a rendering-layer responsibility, not something the backend can guarantee by storing it.
+Nothing about a card is stored on the device or listed by the server. A card is found by recomputing its address.
 
-**Indistinguishability:** per §6.3, the `/fetch` step-1 response shape must not reveal whether `card_identifier` exists. When the identifier is not found, the server returns a fixed placeholder label rather than omitting the field, so response shape stays identical in both cases.
+**`normalize`** applies NFKC, lower-cases, and strips everything outside `[a-z0-9]`, so "HDFC Platinum", "hdfc-platinum", and " HDFC_Platinum " all address the same card. It cannot rescue a genuinely different *word*, which is the scheme's real fragility — the create flow therefore shows the normalized form live as the user types, and confirms all three inputs before encrypting.
 
-**Scope note:** as of this revision, `card_label` is implemented for the `/create` and `/fetch` flows only. The Share flow (§5.4–5.7) does not yet expose it to the receiver; that is a follow-up item, not a decided exclusion.
+**Version tag.** `ccshare-id-v1` separates this derivation's salt space from the AES key derivation (which uses the random per-record `srp_salt`) and version-stamps the normalization rules. Changing `normalize` without bumping the tag makes every stored card unreachable, with a failure indistinguishable from a wrong passkey. Treat both as versioned constants under §3.2, covered by a golden-vector test.
+
+**Why the KDF must be slow here too.** All of the identifier's entropy comes from the passkey. A fast hash would let anyone holding a stored identifier filter passkey candidates cheaply — derive, compare, and only pay for the expensive verifier or GCM-tag check on a match. It runs at the same cost as the AES derivation for that reason, which means create and fetch each run PBKDF2 twice. The two cannot be collapsed into one pass: the AES key is salted with the server-issued `srp_salt`, which is not known until after the identifier has already been used to ask for it.
+
+**Consequences, which are not all improvements:**
+
+| | Effect |
+|---|---|
+| Guessability | An identifier is now as hard to guess as the passkey behind it — strictly better than "user pasted a random UUID from a note", and it removes the enumeration and lockout-griefing exposure that a listable or guessable identifier would create (§6.2). |
+| Secrecy | A leaked identifier is an **offline oracle** for grinding the passkey — no server, no rate limit, unlimited attempts. Identifiers must never appear in URLs (§8.2) or logs (§6.7). This is new; a random identifier leaked nothing but targeting information. |
+| Lockout | A wrong passkey addresses a card that does not exist, so it never reaches the real record's counter. §6.2/§6.4 no longer bound online guessing. |
+| Weight on the passkey | Follows from the above: passkey entropy is close to the only remaining control, so the creation-time strength floor (§10.5) is load-bearing rather than advisory. |
+| Recovery | Get the name, the digits, or the passkey wrong and the card is simply not found. There is no partial match and no hint, by design (§6.3). |
+
+**The card's nickname** travels inside `encrypted_cc_blob` as a `label` field. It was previously a plaintext `card_label` column whose entire purpose was letting `/fetch` step 1 say which card was about to be unlocked *before* the passkey was typed. The user now types the name themselves to derive the identifier, so that plaintext copy answers a question nobody asks any more, while leaking every stored card's nickname to anyone with database access. Encrypting it is strictly better and costs nothing: the payload sits well inside the 512-byte blob cap. Dropped in migration `V3__drop_card_label.sql`.
+
+**Frontend responsibility:** the label is still untrusted user input and must be HTML-escaped on render.
 
 ---
 
@@ -150,19 +169,18 @@ There is no account/login concept in this system, so there is no "my cards" list
 **Request:**
 ```json
 {
-  "card_identifier": "string (client-generated, high-entropy)",
-  "encrypted_cc_blob": "base64 string (IV+ciphertext+tag)",
+  "card_identifier": "string (client-derived, UUIDv4 shape — see §4.3)",
+  "encrypted_cc_blob": "base64 string (IV+ciphertext+tag, includes the card's nickname)",
   "srp_verifier": "hex string",
-  "srp_salt": "hex string",
-  "card_label": "string (user-chosen nickname, ≤100 chars)"
+  "srp_salt": "hex string"
 }
 ```
-**Response:** `200 OK` — no body needed beyond ack.
+**Response:** `200 OK` — no body needed beyond ack. `409 Conflict` if the identifier already exists.
 
 **Server behavior:**
-- Validate `card_identifier` uniqueness and entropy (reject low-entropy/predictable identifiers if self-issued — recommend server-generated identifiers instead, returned in response, to remove client trust dependency).
-- Validate `card_label` is non-blank and ≤100 characters. No entropy/content requirement — it's a cosmetic nickname, not a security-relevant field.
+- Validate `card_identifier` is a well-formed UUIDv4. Its unguessability is now a property of the derivation (§4.3), not something the server can assess.
 - Persist all fields verbatim. Server performs **no decryption, no derivation** — it is a blind store at this step.
+- The insert must be a genuine insert. `card_identifier` is client-assigned, so an ORM that infers newness from a null id will route this through an update and silently discard a second write to an existing identifier — which, with derived identifiers, is an ordinary user action (storing the same card twice) rather than an impossible collision. It has to surface as `409`.
 - Sanitize any string field before writing to Google Sheets (CSV/formula-injection guard — prefix-escape leading `=`, `+`, `-`, `@`).
 
 ---
@@ -178,13 +196,12 @@ There is no account/login concept in this system, so there is no "my cards" list
 {
   "challenge_id": "string",
   "srp_salt": "hex",
-  "server_public_ephemeral": "hex (B)",
-  "card_label": "string"
+  "server_public_ephemeral": "hex (B)"
 }
 ```
 **Server behavior:**
 - Check `locked_until` — if in lockout window, return generic `403` (same shape as invalid-identifier response, see §6.5).
-- Look up `srp_verifier` + `srp_salt` + `card_label` for `card_identifier`. If not found, still generate a plausible-looking dummy challenge and a fixed placeholder `card_label` (constant-time behavior, identical response shape — see §6.5) rather than short-circuiting.
+- Look up `srp_verifier` + `srp_salt` for `card_identifier`. If not found, still generate a plausible-looking dummy challenge (constant-time behavior, identical response shape — see §6.5) rather than short-circuiting. With derived identifiers this is the *normal* response to a mistyped name or a wrong passkey, not an edge case.
 - Generate SRP server ephemeral (`b`, `B`); store `b` against `challenge_id` in Ephemeral Storage with 2-minute TTL, single-use.
 - **No card data touched yet.**
 
@@ -286,21 +303,33 @@ or
 - Suggested: 5 failed proof attempts → 15-minute lockout on that `card_identifier`. Exponential backoff on repeated lockout cycles.
 - Lockout state (`locked_until`) lives on the `cards` record itself (§4.1), not in a separate cache, to survive restarts of any rate-limiting middleware.
 
+> **This control no longer does what it was designed to do.** Since §4.3, a wrong passkey derives the identifier of a card that does not exist, so the guess never reaches the target record and its counter never moves. The lockout still fires for repeated proof failures against an identifier that *does* resolve — which, given a resolving identifier implies a correct passkey, means essentially never in normal operation.
+>
+> Two consequences, in opposite directions. Online passkey guessing is now bounded only by per-IP rate limiting (§6.1) and the ~600ms PBKDF2 cost the attacker pays per candidate — making §6.1 the primary control rather than a supplement, and passkey entropy (§10.5) the thing carrying the weight. But lockout-griefing is now impossible: an attacker cannot lock a card out of spite, because they cannot address it without the passkey.
+>
+> Keep the counters. They cost nothing, they still catch tampered proofs against a resolving identifier, and they are needed again the moment any flow accepts an identifier the caller did not derive.
+
 ### 6.3 Constant-Time / Indistinguishable Responses
 - `card_identifier` not found vs. `card_identifier` found but proof fails → **identical response shape, status code, and approximate timing.** Implement by always generating a real or dummy SRP challenge, never short-circuiting on lookup miss.
 
 ### 6.4 Shared Failure Budget
 - `/fetch` and `/share/authLink` both decrement the same `failed_attempt_count` on a given `card_identifier`, preventing an attacker from splitting guess attempts across endpoints to double their effective attempt budget.
+- Subject to the same caveat as §6.2: for any flow where the caller derives the identifier, a wrong passkey never lands on the shared counter in the first place.
 
 ### 6.5 CardIdentifier Entropy
-- Server-generated, ≥128-bit random token, returned to client at `/create` time. Client should not be trusted to self-generate this value (removes a class of weak-identifier risk from client bugs).
+- **Superseded by §4.3.** The identifier is derived in the browser, not issued by the server. This reverses the original "server-generated, client not trusted" position deliberately: the goal was an unguessable identifier, and derivation achieves it from the passkey's entropy while removing the requirement that the user store and retype a 36-character token.
+- The server can no longer assess an identifier's quality — it validates the UUIDv4 shape and nothing more. A client bug that produced weak identifiers would not be caught here. The golden-vector test required by §3.2 is what guards that instead.
+- **The identifier is now secret-adjacent.** Anyone holding one can grind passkey candidates offline against it. It must not be logged (§6.7), placed in a URL, or shown to the user (§8.2).
 
 ### 6.6 Atomicity in Ephemeral Storage
 - `getApprovedDetails` fetch-and-delete, and public-key fetch-and-delete in `/share/authLink`, must be single atomic operations (conditional delete / transaction), not separate read-then-delete calls — closes the concurrent-poll race (§ threat model, TOCTOU).
 
 ### 6.7 Logging Hygiene
-- Never log: passkeys, SRP proofs (`M1`/`M2`/session key `S`), `encrypted_cc_blob` contents, decrypted plaintext.
-- Do log: failed-attempt counts, lockout triggers, request volumes per `card_identifier` — these are the actual attack-detection signals.
+- Never log: passkeys, SRP proofs (`M1`/`M2`/session key `S`), `encrypted_cc_blob` contents, decrypted plaintext, **or `card_identifier` in the clear**.
+- The identifier joined that list in §4.3: it is derived from the passkey, so a log line carrying one is an offline grinding oracle for it, and log files have a different (usually weaker) blast radius than the database. Log a truncated SHA-256 of the identifier instead — correlation for attack detection still works, grinding does not.
+- Do log: failed-attempt counts, lockout triggers, request volumes per *hashed* identifier — these are the actual attack-detection signals.
+- **Framework loggers count.** Two settings defeated all of the above by logging around the application code: Spring's `RequestResponseBodyMethodProcessor` at `DEBUG` prints the entire deserialized request body (identifier *and* ciphertext), and Hibernate's `BasicBinder` at `TRACE` prints every bound SQL parameter (identifier, verifier, salt, ciphertext). Neither may be enabled anywhere the log persists. Auditing application code alone is not sufficient here.
+- `card_auth_events.card_identifier` (DB design §3) should store the same truncated digest, not the raw value.
 
 ---
 
@@ -309,15 +338,19 @@ or
 | Threat | Mitigated? | Notes |
 |---|---|---|
 | Offline brute-force of stolen ciphertext | ✅ Yes | Ciphertext never released pre-proof; SRP makes the passkey never transmitted or reversible from verifier |
-| Passkey enumeration via repeated online guesses | ✅ Yes | Shared failure counter + lockout across both endpoints |
-| CardIdentifier enumeration/guessing | ✅ Mitigated | High-entropy, server-issued identifiers |
+| Passkey enumeration via repeated online guesses | ⚠️ Weakened by §4.3 | The failure counter no longer sees these guesses (§6.2). What remains is per-IP rate limiting — **not yet implemented** (§6.1) — plus the ~600ms PBKDF2 cost per candidate |
+| CardIdentifier enumeration/guessing | ✅ Mitigated | Derived from the passkey (§4.3); as hard to guess as the passkey itself |
+| Lockout griefing (locking a victim out of their own card) | ✅ Closed by §4.3 | An attacker cannot address a card without the passkey, so cannot burn its attempt budget |
+| Offline passkey grinding from a leaked identifier | ⚠️ New in §4.3 | Identifiers are kept out of logs and URLs (§6.7, §8.2). A database thief already had this capability via `srp_verifier`, so DB exposure is not made worse — log and URL exposure is what changed |
+| Silent data loss on re-storing a card | ✅ Mitigated | Derived identifiers make repeat `/create` calls collide by design; the insert must conflict rather than merge (§5.1) |
 | Wrong-guess burning receiver's one-time public key | ✅ Fixed | Public key only consumed post-proof in `/share/authLink` |
 | Concurrent double-read of share payload | ✅ Mitigated | Atomic fetch-and-delete required (§6.6) |
 | XSS on frontend stealing passkey/plaintext at point of use | ⚠️ Partially — needs CSP, SRI, Worker isolation, minimal DOM dwell time | Frontend remains the true trust boundary; see §8.2 |
 | Malicious backend substituting its own public key in Share flow (MITM) | ⚠️ Residual, not fully closed | Backend brokers the key exchange; consider out-of-band fingerprint verification between sender/receiver for high-assurance use cases |
 | Compromised backend rewriting frontend code | ✅ Closed | Enforced via separate hosting origin (§8.1) |
 | CSV/formula injection into Google Sheets (POC only) | ✅ Mitigated | Input sanitization/prefix-escaping on write |
-| Weak passkey chosen by user | ⚠️ Partially | Argon2id raises cost per guess; UX should enforce minimum entropy at creation |
+| Weak passkey chosen by user | ⚠️ Partially, and now load-bearing | Argon2id/PBKDF2 raises cost per guess; the creation-time floor (§10.5) is enforced in the UI only — `/create` never receives the passkey, so the server has nothing to check and a modified client can store anything. Only the bypasser's own card is weakened |
+| Mistyped card name locking the user out of their own card | ⚠️ Accepted | Inherent to §4.3. Normalization absorbs case, spacing, and punctuation; different words are unrecoverable. Mitigated by showing the normalized form live and confirming all three inputs before encrypting |
 
 ---
 
@@ -332,8 +365,10 @@ or
 - Strict CSP: no `unsafe-inline`, no `unsafe-eval`, explicit `script-src` allowlist.
 - Subresource Integrity (SRI) on all third-party/CDN scripts (crypto libraries especially).
 - Crypto operations (SRP math, AES encrypt/decrypt) isolated in a Web Worker where feasible, to narrow XSS blast radius.
-- `autocomplete="off"` on passkey input; no persistence to localStorage/sessionStorage at any point.
+- `autocomplete="off"` on passkey input; no persistence to localStorage/sessionStorage at any point. This extends to the card identifier — see below.
 - Explicit plaintext-clearing of card data and passkey variables after use/navigation.
+- **No identifier in the URL.** The `#/unlock/<card_identifier>` deep link was removed with §4.3. A derived identifier is an offline passkey oracle, and a link puts it into browser history and into wherever the link is pasted. It is also pointless now: the identifier is recomputed from what the user knows, so there is nothing to link to.
+- The identifier is never displayed to the user either. The create flow confirms the card name, its last four digits, and the passkey — the three things that must be reproduced — and shows no token at all.
 
 ### 8.3 Storage Layer (POC → Production)
 - POC: Google Sheets as `cards` table backing store.
@@ -411,8 +446,11 @@ The custom SRP verification logic (`SrpAuthService`, backed by Bouncy Castle) si
 2. **Mutual SRP authentication (`M2`):** recommend including server proof back to client, so a rogue/MITM backend can't trivially spoof a "success" response.
 3. **Out-of-band public key verification** for the Share flow, to fully close the backend-MITM residual risk in §7 — e.g., a short verification code shown to both sender and receiver out-of-band (spoken, SMS) to confirm they're using the same session.
 4. **PCI-DSS scope determination** — even with this architecture, legal/compliance review recommended given plaintext exists transiently in browser memory.
-5. **Passkey strength enforcement** — minimum entropy requirements at `/create` time, communicated to the user.
+5. **Passkey strength enforcement** — minimum entropy requirements at `/create` time, communicated to the user. Current floor: 16 characters and either three character classes or ten distinct characters. This is now the system's main defence against online guessing (§6.2), and the scorer is a character-class heuristic, which correlates poorly with real guessability — `Passw0rdPassw0rd!` clears it. A length-first rule plus a bundled common-password blocklist would measure the right thing; deferred deliberately, not overlooked.
 6. **CSRF configuration decision (§9.2)** — confirm and document the explicit disabling of Spring Security's default CSRF filter, given the stateless token model.
+7. **Per-IP rate limiting (§6.1) is now on the critical path**, not a supplement. §4.3 removed the per-card lockout's ability to bound online passkey guessing, and nothing has replaced it. This is the highest-priority open item on this list.
+8. **`/fetch` step 1 leaks existence for a locked card.** A locked identifier returns `403` while an unknown one returns a dummy challenge and `200`, so burning a card's attempt budget and re-probing reveals whether it exists — a §6.3 violation. §4.3 makes it near-unreachable (you need the passkey to derive a resolving identifier in the first place), which is why it is listed here rather than fixed, but it should still be closed: drop the early lockout return from step 1 and let step 2 refuse, which it already does.
+9. **Share flow (§5.4–5.7) has not been revisited against §4.3.** It still assumes the sender holds a `card_identifier` to pass around. Under derived identifiers, transmitting one to a receiver would hand them an offline passkey oracle. The flow needs redesigning before implementation, not adapting.
 
 ---
 

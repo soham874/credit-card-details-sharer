@@ -3,6 +3,7 @@ package com.soham.ccshareapp.service;
 import com.soham.ccshareapp.dto.CreateCardRequest;
 import com.soham.ccshareapp.model.Card;
 import com.soham.ccshareapp.repository.CardRepository;
+import com.soham.ccshareapp.util.LogSafe;
 
 import java.util.Base64;
 import java.util.UUID;
@@ -27,9 +28,10 @@ public class CardCreationService {
     }
 
     public void create(CreateCardRequest request) {
-        logger.debug("Starting card creation for identifier: {}", request.card_identifier());
+        String loggableId = LogSafe.identifier(request.card_identifier());
+        logger.debug("Starting card creation for {}", loggableId);
         validateIdentifier(request.card_identifier());
-        logger.debug("Card identifier validation passed: {}", request.card_identifier());
+        logger.debug("Card identifier validation passed for {}", loggableId);
 
         byte[] encryptedBlob = decodeEncryptedBlob(request.encrypted_cc_blob());
         logger.debug("Encrypted blob decoded successfully. Size: {} bytes", encryptedBlob.length);
@@ -39,12 +41,14 @@ public class CardCreationService {
                     request.card_identifier(),
                     encryptedBlob,
                     request.srp_verifier(),
-                    request.srp_salt(),
-                    request.card_label());
+                    request.srp_salt());
             cardRepository.saveAndFlush(card);
-            logger.info("Card stored successfully. ID: {}, Label: {}", request.card_identifier(), request.card_label());
+            logger.info("Card stored successfully: {}", loggableId);
         } catch (DataIntegrityViolationException exception) {
-            logger.warn("Card creation failed: duplicate card_identifier: {}", request.card_identifier());
+            // Identifiers are derived from the card name, last four digits, and
+            // passkey, so a collision means this caller has already stored this
+            // exact card — not that they have stumbled onto someone else's.
+            logger.warn("Card creation failed: identifier already exists: {}", loggableId);
             throw new ResponseStatusException(HttpStatus.CONFLICT, "Card identifier already exists");
         }
     }
@@ -53,12 +57,12 @@ public class CardCreationService {
         try {
             UUID identifier = UUID.fromString(cardIdentifier);
             if (identifier.version() != 4 || identifier.variant() != 2) {
-                logger.warn("Invalid card identifier format: {}", cardIdentifier);
+                logger.warn("Invalid card identifier format: {}", LogSafe.identifier(cardIdentifier));
                 throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "card_identifier must be a UUIDv4");
             }
-            logger.debug("Card identifier is valid UUIDv4: {}", cardIdentifier);
+            logger.debug("Card identifier is a valid UUIDv4: {}", LogSafe.identifier(cardIdentifier));
         } catch (IllegalArgumentException exception) {
-            logger.warn("Card identifier parsing failed: {}", cardIdentifier);
+            logger.warn("Card identifier parsing failed");
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "card_identifier must be a UUIDv4");
         }
     }

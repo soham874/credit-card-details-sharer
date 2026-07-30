@@ -14,14 +14,12 @@ export type CreateCardRequest = {
   encrypted_cc_blob: string;
   srp_verifier: string;
   srp_salt: string;
-  card_label: string;
 };
 
 export type FetchChallengeResponse = {
   challenge_id: string;
   srp_salt: string;
   server_public_ephemeral: string;
-  card_label: string;
 };
 
 export type FetchCardResponse = {
@@ -89,7 +87,7 @@ export async function createCard(request: CreateCardRequest): Promise<void> {
   await postJson<void>("/create", request);
 }
 
-/** `POST /fetch` step 1 — asks for an SRP challenge and the card's label. */
+/** `POST /fetch` step 1 — asks for an SRP challenge against a derived identifier. */
 export async function initiateFetch(cardIdentifier: string): Promise<FetchChallengeResponse> {
   return postJson<FetchChallengeResponse>("/fetch", { card_identifier: cardIdentifier });
 }

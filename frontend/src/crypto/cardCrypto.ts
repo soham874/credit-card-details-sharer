@@ -17,6 +17,14 @@ import {
 import { wipe } from "./encoding";
 
 export type CardDetails = {
+  /**
+   * The card's name. It used to be stored beside the ciphertext in plaintext so
+   * `/fetch` step 1 could say which card was being unlocked before the passkey
+   * was typed. The user now types the name themselves to derive the identifier,
+   * so that plaintext copy bought nothing and leaked every nickname to anyone
+   * with database access — it lives in here instead (V3 dropped the column).
+   */
+  label: string;
   cardNumber: string;
   expiry: string;
   cvv: string;
@@ -32,6 +40,7 @@ export type CardDetails = {
  */
 function serialize(details: CardDetails): Uint8Array {
   const payload: Record<string, string> = {
+    label: details.label,
     cardNumber: details.cardNumber,
     expiry: details.expiry,
     cvv: details.cvv,
@@ -45,6 +54,7 @@ function serialize(details: CardDetails): Uint8Array {
 function deserialize(bytes: Uint8Array): CardDetails {
   const parsed = JSON.parse(new TextDecoder().decode(bytes)) as Partial<CardDetails>;
   return {
+    label: parsed.label ?? "",
     cardNumber: parsed.cardNumber ?? "",
     expiry: parsed.expiry ?? "",
     cvv: parsed.cvv ?? "",

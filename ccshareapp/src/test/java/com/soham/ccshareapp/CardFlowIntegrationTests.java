@@ -41,6 +41,15 @@ class CardFlowIntegrationTests {
     private static final SRP6CryptoParams SRP_CRYPTO_PARAMS = SRP6CryptoParams.getInstance(2048, "SHA-256");
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
+    /**
+     * Models what the browser encrypts, key-for-key, including the card's
+     * nickname — the `card_label` column is gone, so the label now travels
+     * inside the blob. Must stay in step with `cardCrypto.ts#serialize`
+     * (LLD §3.2): a key renamed on one side makes stored cards unreadable.
+     */
+    private static final String CARD_DETAILS_JSON =
+            "{\"label\":\"HDFC Platinum\",\"cardNumber\":\"4111111111111111\",\"expiry\":\"12/30\",\"cvv\":\"123\",\"pin\":\"1234\"}";
+
     private MockMvc mockMvc;
 
     @Autowired
@@ -58,7 +67,7 @@ class CardFlowIntegrationTests {
         String cardIdentifier = java.util.UUID.randomUUID().toString();
         String correctPasskey = "correct-passkey";
         String wrongPasskey = "wrong-passkey";
-        String cardDetails = "{\"cardNumber\":\"4111111111111111\",\"expiry\":\"12/30\",\"cvv\":\"123\",\"pin\":\"1234\"}";
+        String cardDetails = CARD_DETAILS_JSON;
         byte[] srpSalt = randomBytes(16);
         String srpSaltHex = HexFormat.of().formatHex(srpSalt);
 
@@ -69,8 +78,7 @@ class CardFlowIntegrationTests {
                 cardIdentifier,
                 Base64.getEncoder().encodeToString(encryptedCardBlob),
                 verifier.toString(16),
-                srpSaltHex,
-                "Test Card"));
+                srpSaltHex));
 
         mockMvc.perform(post("/create")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -118,20 +126,18 @@ class CardFlowIntegrationTests {
         String cardIdentifier = java.util.UUID.randomUUID().toString();
         String correctPasskey = "correct-passkey-kept-in-browser-memory";
         String wrongPasskey = "wrong-passkey-different";
-        String cardDetails = "{\"cardNumber\":\"4111111111111111\",\"expiry\":\"12/30\",\"cvv\":\"123\",\"pin\":\"1234\"}";
+        String cardDetails = CARD_DETAILS_JSON;
         byte[] srpSalt = randomBytes(16);
         String srpSaltHex = HexFormat.of().formatHex(srpSalt);
 
         byte[] encryptedCardBlob = encryptInBrowser(cardDetails, correctPasskey, srpSalt);
         BigInteger verifier = new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
                 .generateVerifier(new BigInteger(1, srpSalt), cardIdentifier, correctPasskey);
-        String cardLabel = "HDFC Platinum";
         String createPayload = objectMapper.writeValueAsString(new CreatePayload(
                 cardIdentifier,
                 Base64.getEncoder().encodeToString(encryptedCardBlob),
                 verifier.toString(16),
-                srpSaltHex,
-                cardLabel));
+                srpSaltHex));
 
         mockMvc.perform(post("/create")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -170,23 +176,97 @@ class CardFlowIntegrationTests {
     }
 
     @Test
+    void rejectsASecondCardWithTheSameIdentifierAndKeepsTheOriginal() throws Exception {
+        // Identifiers are derived in the browser from the card name, its last four
+        // digits, and the passkey, so storing the same card twice yields the same
+        // primary key. Spring Data treats a client-assigned id as already-persistent
+        // and would otherwise route this through merge — which, with every payload
+        // column `updatable = false`, silently discarded the second write and still
+        // answered 200. `Card` implements `Persistable` so this inserts and conflicts.
+        String cardIdentifier = java.util.UUID.randomUUID().toString();
+        String passkey = "same-passkey-both-times";
+        byte[] srpSalt = randomBytes(16);
+
+        byte[] originalBlob = encryptInBrowser(CARD_DETAILS_JSON, passkey, srpSalt);
+        BigInteger verifier = new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
+                .generateVerifier(new BigInteger(1, srpSalt), cardIdentifier, passkey);
+
+        mockMvc.perform(post("/create")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new CreatePayload(
+                                cardIdentifier,
+                                Base64.getEncoder().encodeToString(originalBlob),
+                                verifier.toString(16),
+                                HexFormat.of().formatHex(srpSalt)))))
+                .andExpect(status().isOk());
+
+        // A different card, stored under the identifier that already exists.
+        String replacement = "{\"label\":\"Overwritten\",\"cardNumber\":\"5555555555554444\",\"expiry\":\"01/31\",\"cvv\":\"999\"}";
+        byte[] replacementSalt = randomBytes(16);
+        mockMvc.perform(post("/create")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new CreatePayload(
+                                cardIdentifier,
+                                Base64.getEncoder().encodeToString(
+                                        encryptInBrowser(replacement, passkey, replacementSalt)),
+                                new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
+                                        .generateVerifier(new BigInteger(1, replacementSalt), cardIdentifier, passkey)
+                                        .toString(16),
+                                HexFormat.of().formatHex(replacementSalt)))))
+                .andExpect(status().isConflict());
+
+        // The first card is still the one stored, byte for byte.
+        String challengeBody = mockMvc.perform(post("/fetch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new InitiateFetchPayload(cardIdentifier))))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        JsonNode challenge = objectMapper.readTree(challengeBody);
+        assertEquals(HexFormat.of().formatHex(srpSalt), challenge.required("srp_salt").asString());
+
+        SRP6ClientSession clientSession = new SRP6ClientSession();
+        clientSession.step1(cardIdentifier, passkey);
+        SRP6ClientCredentials credentials = clientSession.step2(
+                SRP_CRYPTO_PARAMS,
+                parseHex(challenge.required("srp_salt").asString()),
+                parseHex(challenge.required("server_public_ephemeral").asString()));
+
+        String proofBody = mockMvc.perform(post("/fetch")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(new FetchProofPayload(
+                                challenge.required("challenge_id").asString(),
+                                credentials.A.toString(16),
+                                credentials.M1.toString(16)))))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        String stored = decryptInBrowser(
+                Base64.getDecoder().decode(objectMapper.readTree(proofBody).required("encrypted_cc_blob").asString()),
+                passkey,
+                srpSalt);
+        assertEquals(CARD_DETAILS_JSON, stored);
+    }
+
+    @Test
     void createsAndFetchesAnEncryptedCardThroughTheFrontendFlow() throws Exception {
         String cardIdentifier = java.util.UUID.randomUUID().toString();
         String passkey = "test-passkey-kept-in-browser-memory";
-        String cardDetails = "{\"cardNumber\":\"4111111111111111\",\"expiry\":\"12/30\",\"cvv\":\"123\",\"pin\":\"1234\"}";
+        String cardDetails = CARD_DETAILS_JSON;
         byte[] srpSalt = randomBytes(16);
         String srpSaltHex = HexFormat.of().formatHex(srpSalt);
 
         byte[] encryptedCardBlob = encryptInBrowser(cardDetails, passkey, srpSalt);
         BigInteger verifier = new SRP6VerifierGenerator(SRP_CRYPTO_PARAMS)
                 .generateVerifier(new BigInteger(1, srpSalt), cardIdentifier, passkey);
-        String cardLabel = "HDFC Platinum";
         String createPayload = objectMapper.writeValueAsString(new CreatePayload(
                 cardIdentifier,
                 Base64.getEncoder().encodeToString(encryptedCardBlob),
                 verifier.toString(16),
-                srpSaltHex,
-                cardLabel));
+                srpSaltHex));
 
         mockMvc.perform(post("/create")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -205,7 +285,6 @@ class CardFlowIntegrationTests {
         String returnedSalt = challenge.required("srp_salt").asString();
         BigInteger serverPublicEphemeral = parseHex(challenge.required("server_public_ephemeral").asString());
         assertEquals(srpSaltHex, returnedSalt);
-        assertEquals(cardLabel, challenge.required("card_label").asString());
 
         SRP6ClientSession clientSession = new SRP6ClientSession();
         clientSession.step1(cardIdentifier, passkey);
@@ -273,7 +352,7 @@ class CardFlowIntegrationTests {
         return new BigInteger(1, HexFormat.of().parseHex(normalizedValue));
     }
 
-    private record CreatePayload(String card_identifier, String encrypted_cc_blob, String srp_verifier, String srp_salt, String card_label) {
+    private record CreatePayload(String card_identifier, String encrypted_cc_blob, String srp_verifier, String srp_salt) {
     }
 
     private record InitiateFetchPayload(String card_identifier) {

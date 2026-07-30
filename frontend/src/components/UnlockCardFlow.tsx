@@ -1,89 +1,65 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
-import { ApiError, initiateFetch, proveFetch, type FetchChallengeResponse } from "../api/cardApi";
-import { isUuidV4, maskCardNumber } from "../cardUtils";
+import { ApiError, initiateFetch, proveFetch } from "../api/cardApi";
+import { digitsOnly, maskCardNumber } from "../cardUtils";
 import type { CardDetails } from "../crypto/cardCrypto";
-import {
-  CHALLENGE_TTL_SECONDS,
-  LOCKOUT_MINUTES,
-  MAX_FAILED_ATTEMPTS,
-  PLAINTEXT_DWELL_SECONDS,
-} from "../crypto/constants";
-import { discardUnlock, proveUnlock, unsealCard } from "../crypto/cryptoClient";
+import { normalizeCardName } from "../crypto/cardIdentifier";
+import { MAX_CARD_LABEL_LENGTH, PLAINTEXT_DWELL_SECONDS } from "../crypto/constants";
+import { beginUnlock, discardUnlock, proveUnlock, unsealCard } from "../crypto/cryptoClient";
 import { CardPreview } from "./CardPreview";
 import { PasskeyField } from "./PasskeyField";
 
-type Stage = "identifier" | "requesting" | "passkey" | "proving" | "revealed";
+type Stage = "form" | "working" | "revealed";
 
 type Props = {
-  /** Pre-filled when arriving from the create flow or a deep link. */
-  initialIdentifier?: string;
+  /** Pre-filled when arriving straight from the create flow. */
+  initialHandle?: { cardName: string; last4: string };
 };
 
 /**
- * The `/fetch` flow (LLD §5.2, §5.3):
- *   step 1  identifier -> challenge + card label
- *   step 2  passkey    -> A, M1 -> ciphertext + M2 -> decrypt locally
+ * The `/fetch` flow (LLD §5.2, §5.3), as one shot.
  *
- * The passkey is used inside the crypto worker and is never sent anywhere. The
- * decrypted card is held in state only, wiped on a timer and on unmount.
+ * The card identifier is derived in the worker from the name, the last four
+ * digits, and the passkey, so all three are collected up front and the two
+ * server round trips happen without further input:
+ *
+ *   derive -> challenge -> A, M1 -> ciphertext + M2 -> decrypt locally
+ *
+ * A wrong input of any kind produces the identifier of a card that does not
+ * exist, which the server answers exactly as it answers a wrong passkey against
+ * a real card (LLD §6.3). The UI must not pretend to know which it was.
  */
-export function UnlockCardFlow({ initialIdentifier }: Props) {
-  const [cardIdentifier, setCardIdentifier] = useState(initialIdentifier ?? "");
-  const [stage, setStage] = useState<Stage>("identifier");
-  const [challenge, setChallenge] = useState<FetchChallengeResponse | undefined>();
+export function UnlockCardFlow({ initialHandle }: Props) {
+  const [cardName, setCardName] = useState(initialHandle?.cardName ?? "");
+  const [last4, setLast4] = useState(initialHandle?.last4 ?? "");
   const [passkey, setPasskey] = useState("");
+  const [stage, setStage] = useState<Stage>("form");
+  const [progress, setProgress] = useState("");
   const [card, setCard] = useState<CardDetails | undefined>();
-  /** Kept separately from `challenge`, which is cleared as soon as it is spent. */
-  const [unlockedLabel, setUnlockedLabel] = useState("");
   const [error, setError] = useState<string | undefined>();
-  const [challengeSecondsLeft, setChallengeSecondsLeft] = useState(CHALLENGE_TTL_SECONDS);
   const [dwellSecondsLeft, setDwellSecondsLeft] = useState(PLAINTEXT_DWELL_SECONDS);
   const [revealNumber, setRevealNumber] = useState(false);
 
-  /** Worker-side SRP session awaiting the server's response, if any. */
-  const openProveId = useRef<number | undefined>(undefined);
+  /** Worker-side session holding the passkey for this unlock, if one is open. */
+  const openUnlockId = useRef<number | undefined>(undefined);
 
-  const releaseProveSession = useCallback(() => {
-    if (openProveId.current !== undefined) {
-      discardUnlock(openProveId.current);
-      openProveId.current = undefined;
+  const releaseUnlockSession = useCallback(() => {
+    if (openUnlockId.current !== undefined) {
+      discardUnlock(openUnlockId.current);
+      openUnlockId.current = undefined;
     }
   }, []);
 
-  const reset = useCallback(
-    (nextStage: Stage) => {
-      releaseProveSession();
-      setChallenge(undefined);
-      setPasskey("");
-      setCard(undefined);
-      setUnlockedLabel("");
-      setRevealNumber(false);
-      setStage(nextStage);
-    },
-    [releaseProveSession],
-  );
-
   // Wipe anything sensitive if this component goes away (LLD §8.2).
-  useEffect(() => releaseProveSession, [releaseProveSession]);
+  useEffect(() => releaseUnlockSession, [releaseUnlockSession]);
 
   useEffect(() => {
-    if (initialIdentifier) {
-      setCardIdentifier(initialIdentifier);
-      setStage("identifier");
+    if (initialHandle) {
+      setCardName(initialHandle.cardName);
+      setLast4(initialHandle.last4);
+      setStage("form");
     }
-  }, [initialIdentifier]);
-
-  // The server drops the challenge after 2 minutes; count down so an expired
-  // submission is explained rather than looking like a wrong passkey.
-  useEffect(() => {
-    if (stage !== "passkey") return;
-    setChallengeSecondsLeft(CHALLENGE_TTL_SECONDS);
-    const timer = setInterval(() => {
-      setChallengeSecondsLeft((seconds) => Math.max(0, seconds - 1));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [stage, challenge]);
+  }, [initialHandle]);
 
   // Bound how long plaintext sits in the DOM.
   useEffect(() => {
@@ -94,9 +70,8 @@ export function UnlockCardFlow({ initialIdentifier }: Props) {
         if (seconds <= 1) {
           clearInterval(timer);
           setCard(undefined);
-          setUnlockedLabel("");
           setRevealNumber(false);
-          setStage("identifier");
+          setStage("form");
           return 0;
         }
         return seconds - 1;
@@ -105,53 +80,38 @@ export function UnlockCardFlow({ initialIdentifier }: Props) {
     return () => clearInterval(timer);
   }, [stage]);
 
-  async function requestChallenge(identifier: string) {
-    setError(undefined);
-    setStage("requesting");
-    try {
-      const received = await initiateFetch(identifier.trim());
-      setChallenge(received);
-      setPasskey("");
-      setStage("passkey");
-    } catch (caught) {
-      setStage("identifier");
-      setError(
-        caught instanceof ApiError && caught.status === 403
-          ? `This card is unavailable. After ${MAX_FAILED_ATTEMPTS} failed attempts a card locks for ${LOCKOUT_MINUTES} minutes — if that just happened, wait and try again.`
-          : caught instanceof Error
-            ? caught.message
-            : "Could not start the unlock.",
-      );
-    }
-  }
-
-  function handleIdentifierSubmit(event: FormEvent) {
+  async function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!isUuidV4(cardIdentifier)) {
-      setError("That does not look like a card identifier. Paste the full UUID you were given.");
+    if (!normalizeCardName(cardName)) {
+      setError("Enter the card's name — the one you chose when you stored it.");
       return;
     }
-    void requestChallenge(cardIdentifier);
-  }
-
-  async function handlePasskeySubmit(event: FormEvent) {
-    event.preventDefault();
-    if (!challenge || !passkey) return;
+    if (!/^\d{4}$/.test(last4)) {
+      setError("Enter the last 4 digits of the card number.");
+      return;
+    }
+    if (!passkey) return;
 
     setError(undefined);
-    setStage("proving");
+    setStage("working");
+    setProgress("Deriving this card's identifier…");
+
     try {
-      // Worker computes A and M1 and holds the session; the passkey stays there.
+      // The worker derives the identifier and keeps the passkey; this thread
+      // never needs it again, so it goes immediately.
+      const handle = await beginUnlock(cardName, last4, passkey);
+      openUnlockId.current = handle.unlockId;
+      setPasskey("");
+
+      setProgress("Asking the server for a challenge…");
+      const challenge = await initiateFetch(handle.cardIdentifier);
+
+      setProgress("Proving you know the passkey…");
       const proof = await proveUnlock(
-        cardIdentifier.trim(),
-        passkey,
+        handle.unlockId,
         challenge.srp_salt,
         challenge.server_public_ephemeral,
       );
-      openProveId.current = proof.proveId;
-      // The passkey is no longer needed on this thread.
-      setPasskey("");
-
       const result = await proveFetch(
         challenge.challenge_id,
         proof.clientPublicEphemeral,
@@ -159,45 +119,47 @@ export function UnlockCardFlow({ initialIdentifier }: Props) {
       );
 
       // Verifies the server's M2 before decrypting, then wipes the session.
+      setProgress("Decrypting…");
       const details = await unsealCard(
-        proof.proveId,
+        handle.unlockId,
         result.encrypted_cc_blob,
         result.server_proof,
       );
-      openProveId.current = undefined;
+      openUnlockId.current = undefined;
 
       setCard(details);
-      setUnlockedLabel(challenge.card_label);
-      setChallenge(undefined);
       setStage("revealed");
     } catch (caught) {
-      releaseProveSession();
-      setChallenge(undefined);
-      setStage("identifier");
+      releaseUnlockSession();
+      setPasskey("");
+      setStage("form");
       setError(
         caught instanceof ApiError && caught.status === 403
-          ? // §6.3: the server returns the same 403 for a wrong passkey, an
-            // unknown identifier, and a lockout. Do not invent a distinction.
-            `Could not unlock. The identifier or passkey is wrong, or the card is locked. Cards lock for ${LOCKOUT_MINUTES} minutes after ${MAX_FAILED_ATTEMPTS} failed attempts.`
+          ? // §6.3: the server cannot tell a wrong passkey from a card that was
+            // never stored, and neither can we. Do not invent a distinction.
+            "Could not unlock. The card name, last 4 digits, or passkey does not match anything stored — all three have to be exactly right."
           : caught instanceof Error
             ? caught.message
             : "Could not unlock the card.",
       );
+    } finally {
+      setProgress("");
     }
   }
 
   function hideNow() {
     setCard(undefined);
-    setUnlockedLabel("");
     setRevealNumber(false);
-    setStage("identifier");
+    setStage("form");
     setError(undefined);
   }
 
   if (stage === "revealed" && card) {
     return (
       <section className="panel">
-        <h2>Unlocked</h2>
+        <h2>
+          Unlocked <span className="card-name">{card.label}</span>
+        </h2>
         <p className="lede">
           Decrypted in this browser. Nothing is stored locally — this disappears in{" "}
           <strong>{dwellSecondsLeft}s</strong>.
@@ -208,7 +170,7 @@ export function UnlockCardFlow({ initialIdentifier }: Props) {
           holder={card.holder}
           expiry={card.expiry}
           cvv={card.cvv}
-          label={unlockedLabel}
+          label={card.label}
           revealed={revealNumber}
         />
 
@@ -240,88 +202,72 @@ export function UnlockCardFlow({ initialIdentifier }: Props) {
     );
   }
 
-  if ((stage === "passkey" || stage === "proving") && challenge) {
-    const expired = challengeSecondsLeft === 0;
-    return (
-      <section className="panel">
-        <h2>
-          Enter passkey for <span className="card-name">{challenge.card_label}</span>
-        </h2>
-        <p className="lede">
-          The server sent a challenge. Your passkey answers it without ever being transmitted.
-        </p>
-
-        <form onSubmit={handlePasskeySubmit} noValidate>
-          <PasskeyField
-            label="Passkey"
-            value={passkey}
-            onChange={setPasskey}
-            autoFocus
-            disabled={stage === "proving" || expired}
-          />
-
-          <p className={`field-hint ${expired ? "warn" : ""}`}>
-            {expired
-              ? "This challenge expired. Request a new one to try again."
-              : `Challenge expires in ${challengeSecondsLeft}s.`}
-          </p>
-
-          {error && <p className="error-text">{error}</p>}
-
-          <button
-            type="submit"
-            className="button full"
-            disabled={stage === "proving" || expired || !passkey}
-          >
-            {stage === "proving" ? "Proving and decrypting…" : "Unlock card"}
-          </button>
-        </form>
-
-        <button
-          type="button"
-          className="button link"
-          onClick={() => {
-            reset("identifier");
-            setError(undefined);
-          }}
-          disabled={stage === "proving"}
-        >
-          Use a different card
-        </button>
-      </section>
-    );
-  }
+  const working = stage === "working";
+  const normalizedName = normalizeCardName(cardName);
 
   return (
     <section className="panel">
       <h2>Unlock a card</h2>
       <p className="lede">
-        Paste the identifier you were given when the card was stored. There is no account and no
-        card list by design — the identifier is the only handle on the record.
+        Nothing about your cards is stored on this device or listed by the server. A card is found by
+        recomputing its address from what you know about it.
       </p>
 
-      <form onSubmit={handleIdentifierSubmit} noValidate>
+      <form onSubmit={handleSubmit} noValidate>
         <div className="field">
-          <label className="field-label" htmlFor="unlock-identifier">
-            Card identifier
+          <label className="field-label" htmlFor="unlock-card-name">
+            Card name
           </label>
           <input
-            id="unlock-identifier"
-            className="input mono"
-            value={cardIdentifier}
-            onChange={(event) => setCardIdentifier(event.target.value)}
-            placeholder="550e8400-e29b-41d4-a716-446655440000"
+            id="unlock-card-name"
+            className="input"
+            value={cardName}
+            onChange={(event) => setCardName(event.target.value.slice(0, MAX_CARD_LABEL_LENGTH))}
+            placeholder="HDFC Platinum"
             autoComplete="off"
             spellCheck={false}
-            disabled={stage === "requesting"}
+            disabled={working}
+          />
+          {normalizedName && (
+            <p className="field-hint">
+              Looking for <code>{normalizedName}</code>. Spacing, capitals, and punctuation do not
+              matter.
+            </p>
+          )}
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="unlock-last4">
+            Last 4 digits
+          </label>
+          <input
+            id="unlock-last4"
+            className="input mono"
+            value={last4}
+            onChange={(event) => setLast4(digitsOnly(event.target.value).slice(0, 4))}
+            placeholder="1234"
+            inputMode="numeric"
+            autoComplete="off"
+            spellCheck={false}
+            disabled={working}
           />
         </div>
 
+        <PasskeyField
+          label="Passkey"
+          value={passkey}
+          onChange={setPasskey}
+          autoFocus={Boolean(initialHandle)}
+          disabled={working}
+        />
+
         {error && <p className="error-text">{error}</p>}
 
-        <button type="submit" className="button full" disabled={stage === "requesting"}>
-          {stage === "requesting" ? "Requesting challenge…" : "Continue"}
+        <button type="submit" className="button full" disabled={working || !passkey}>
+          {working ? "Working…" : "Unlock card"}
         </button>
+
+        {working && progress && <p className="field-hint center">{progress}</p>}
       </form>
     </section>
   );

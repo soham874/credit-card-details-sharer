@@ -6,6 +6,7 @@ import com.soham.ccshareapp.dto.FetchInitiateRequest;
 import com.soham.ccshareapp.dto.FetchProofRequest;
 import com.soham.ccshareapp.model.Card;
 import com.soham.ccshareapp.repository.CardRepository;
+import com.soham.ccshareapp.util.LogSafe;
 
 import java.math.BigInteger;
 import java.security.SecureRandom;
@@ -28,6 +29,18 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
+/**
+ * SRP-6a challenge/proof for {@code /fetch} (LLD §5.2, §5.3).
+ *
+ * <p>Note on the lockout counters below: identifiers are now derived in the
+ * browser from the card name, its last four digits, and the passkey, so a wrong
+ * passkey produces a <em>different</em> identifier and this service never sees
+ * the real row at all. {@code failed_attempt_count} and {@code locked_until}
+ * therefore no longer bound online passkey guessing — per-IP rate limiting is
+ * what has to do that (LLD §6.1). They are kept because they still stop repeated
+ * proof failures against an identifier that does resolve, and because a card
+ * nobody can address is a card nobody can lock out of spite.
+ */
 @Service
 public class CardFetchService {
 
@@ -36,7 +49,6 @@ public class CardFetchService {
     private static final Duration CHALLENGE_TTL = Duration.ofMinutes(2);
     private static final Duration LOCKOUT_DURATION = Duration.ofMinutes(15);
     private static final int MAX_FAILED_ATTEMPTS = 5;
-    private static final String DUMMY_CARD_LABEL = "Card";
 
     private final CardRepository cardRepository;
     private final SecureRandom secureRandom = new SecureRandom();
@@ -48,38 +60,36 @@ public class CardFetchService {
     }
 
     public FetchChallengeResponse initiate(FetchInitiateRequest request) {
-        logger.debug("Fetch initiate: validating card_identifier: {}", request.card_identifier());
+        String loggableId = LogSafe.identifier(request.card_identifier());
+        logger.debug("Fetch initiate: validating card reference {}", loggableId);
         validateCardIdentifier(request.card_identifier());
 
         Card card = cardRepository.findById(request.card_identifier()).orElse(null);
         if (card != null && card.isLocked(Instant.now())) {
-            logger.warn("Fetch initiate blocked: card locked due to failed attempts. card_id={}", request.card_identifier());
+            logger.warn("Fetch initiate blocked: card locked due to failed attempts. card={}", loggableId);
             throw forbidden();
         }
 
         boolean cardExists = card != null;
         if (cardExists) {
-            logger.info("Fetch initiate: card found. card_id={}, label={}", request.card_identifier(), card.getCardLabel());
+            logger.info("Fetch initiate: card found. card={}", loggableId);
         } else {
-            logger.debug("Fetch initiate: card not found (non-existent identifier). Generating dummy challenge for constant-time behavior.");
+            logger.debug("Fetch initiate: no such card. Generating dummy challenge for constant-time behavior.");
         }
 
         SRP6ServerSession session = new SRP6ServerSession(SRP_CRYPTO_PARAMS, (int) CHALLENGE_TTL.toSeconds());
         String salt;
         BigInteger verifier;
-        String cardLabel;
 
         if (cardExists) {
             salt = card.getSrpSalt();
             verifier = parseHex(card.getSrpVerifier());
-            cardLabel = card.getCardLabel();
-            logger.debug("Fetch initiate: using real card credentials for SRP step 1. card_id={}", request.card_identifier());
+            logger.debug("Fetch initiate: using real card credentials for SRP step 1. card={}", loggableId);
         } else {
             byte[] dummySalt = new byte[16];
             secureRandom.nextBytes(dummySalt);
             salt = HexFormat.of().formatHex(dummySalt);
             verifier = new BigInteger(SRP_CRYPTO_PARAMS.N.bitLength() - 1, secureRandom);
-            cardLabel = DUMMY_CARD_LABEL;
             logger.debug("Fetch initiate: using dummy credentials for constant-time behavior");
         }
 
@@ -93,7 +103,7 @@ public class CardFetchService {
         logger.info("SRP challenge issued. challenge_id={}, card_exists={}, ttl={}s", challengeId, cardExists, CHALLENGE_TTL.toSeconds());
         logger.debug("Challenge stored in ephemeral map. Total active challenges: {}", challenges.size());
 
-        return new FetchChallengeResponse(challengeId, salt, toHex(serverPublicEphemeral), cardLabel);
+        return new FetchChallengeResponse(challengeId, salt, toHex(serverPublicEphemeral));
     }
 
     @Transactional(noRollbackFor = ResponseStatusException.class)
@@ -112,7 +122,8 @@ public class CardFetchService {
             throw forbidden();
         }
 
-        logger.debug("Fetch prove: challenge found and valid. card_id={}, challenge_id={}", challenge.cardIdentifier(), request.challenge_id());
+        String loggableId = LogSafe.identifier(challenge.cardIdentifier());
+        logger.debug("Fetch prove: challenge found and valid. card={}, challenge_id={}", loggableId, request.challenge_id());
 
         Card card = challenge.cardExists() ? cardRepository.findById(challenge.cardIdentifier()).orElse(null) : null;
         try {
@@ -121,15 +132,14 @@ public class CardFetchService {
                     parseHex(request.client_proof()));
 
             if (card == null || card.isLocked(Instant.now())) {
-                logger.warn("Fetch prove failed: card not found or locked. card_id={}", challenge.cardIdentifier());
+                logger.warn("Fetch prove failed: card not found or locked. card={}", loggableId);
                 throw forbidden();
             }
 
-            logger.debug("SRP proof verification passed for card: {}", challenge.cardIdentifier());
+            logger.debug("SRP proof verification passed for card {}", loggableId);
             card.resetFailedAttempts();
             cardRepository.saveAndFlush(card);
-            logger.info("Fetch prove successful: card credentials verified and retrieved. card_id={}", challenge.cardIdentifier());
-            logger.debug("Failed attempt counter reset to 0 for card: {}", challenge.cardIdentifier());
+            logger.info("Fetch prove successful: card credentials verified and retrieved. card={}", loggableId);
 
             return new FetchCardResponse(Base64.getEncoder().encodeToString(card.getEncryptedCcBlob()), toHex(serverProof));
         } catch (SRP6Exception | IllegalArgumentException exception) {
@@ -137,10 +147,10 @@ public class CardFetchService {
             if (card != null) {
                 int failedCount = card.getFailedAttemptCount() + 1;
                 card.recordFailedAttempt(Instant.now(), MAX_FAILED_ATTEMPTS, LOCKOUT_DURATION);
-                logger.warn("Fetch prove failed: invalid proof. card_id={}, failed_attempts={}/{}", challenge.cardIdentifier(), failedCount, MAX_FAILED_ATTEMPTS);
+                logger.warn("Fetch prove failed: invalid proof. card={}, failed_attempts={}/{}", loggableId, failedCount, MAX_FAILED_ATTEMPTS);
 
                 if (card.isLocked(Instant.now())) {
-                    logger.warn("Card locked due to excessive failed attempts. card_id={}, locked_until={}", challenge.cardIdentifier(), card.getLockedUntil());
+                    logger.warn("Card locked due to excessive failed attempts. card={}, locked_until={}", loggableId, card.getLockedUntil());
                 }
                 cardRepository.saveAndFlush(card);
             }
@@ -152,12 +162,12 @@ public class CardFetchService {
         try {
             UUID identifier = UUID.fromString(cardIdentifier);
             if (identifier.version() != 4 || identifier.variant() != 2) {
-                logger.warn("Invalid card identifier format (not UUIDv4): {}", cardIdentifier);
+                logger.warn("Invalid card identifier format (not UUIDv4)");
                 throw badRequest();
             }
-            logger.debug("Card identifier validation passed: {}", cardIdentifier);
+            logger.debug("Card identifier validation passed");
         } catch (IllegalArgumentException exception) {
-            logger.warn("Card identifier parsing failed: {}", cardIdentifier);
+            logger.warn("Card identifier parsing failed");
             throw badRequest();
         }
     }

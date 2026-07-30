@@ -5,6 +5,7 @@ import com.soham.ccshareapp.dto.FetchInitiateRequest;
 import com.soham.ccshareapp.dto.FetchProofRequest;
 import com.soham.ccshareapp.service.CardCreationService;
 import com.soham.ccshareapp.service.CardFetchService;
+import com.soham.ccshareapp.util.LogSafe;
 
 import tools.jackson.databind.JsonNode;
 
@@ -34,10 +35,9 @@ public class CardController {
 
     @PostMapping("/create")
     public ResponseEntity<Void> create(@Valid @RequestBody CreateCardRequest request) {
-        logger.info("POST /create received for card: {}", request.card_identifier());
-        logger.debug("Card label: {}", request.card_label());
+        logger.info("POST /create received for card {}", LogSafe.identifier(request.card_identifier()));
         cardCreationService.create(request);
-        logger.info("Card created successfully: {}", request.card_identifier());
+        logger.info("Card created successfully: {}", LogSafe.identifier(request.card_identifier()));
         return ResponseEntity.ok().build();
     }
 
@@ -46,21 +46,19 @@ public class CardController {
         logger.debug("POST /fetch received with payload size: {} bytes", request.toString().length());
         if (request.hasNonNull("card_identifier") && request.size() == 1) {
             String cardId = request.path("card_identifier").asString();
-            logger.info("Fetch step 1 (initiate): card_identifier={}", cardId);
-            logger.debug("Initiating SRP challenge for card: {}", cardId);
+            logger.info("Fetch step 1 (initiate): card={}", LogSafe.identifier(cardId));
             return cardFetchService.initiate(new FetchInitiateRequest(cardId));
         }
         if (request.hasNonNull("challenge_id") && request.hasNonNull("client_public_ephemeral")
                 && request.hasNonNull("client_proof") && request.size() == 3) {
             String challengeId = request.path("challenge_id").asString();
             logger.info("Fetch step 2 (prove): challenge_id={}", challengeId);
-            logger.debug("Validating SRP proof for challenge: {}", challengeId);
             return cardFetchService.prove(new FetchProofRequest(
                     challengeId,
                     request.path("client_public_ephemeral").asString(),
                     request.path("client_proof").asString()));
         }
-        logger.warn("Invalid fetch request received: {}", request.toString());
+        logger.warn("Invalid fetch request received");
         throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid fetch request");
     }
 }

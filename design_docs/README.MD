@@ -194,11 +194,10 @@ When the application is running:
 
 Required request fields:
 
-- `card_identifier`: UUIDv4
-- `encrypted_cc_blob`: Base64-encoded encrypted bytes
+- `card_identifier`: UUIDv4. Derived in the browser from the card name, its last four digits, and the passkey (LLD §4.3) — the server cannot compute or verify it beyond checking the shape, since it never sees the passkey.
+- `encrypted_cc_blob`: Base64-encoded encrypted bytes. Includes the card's nickname; there is no plaintext label column (dropped in `V3__drop_card_label.sql`).
 - `srp_verifier`: hexadecimal SRP verifier
 - `srp_salt`: hexadecimal SRP salt
-- `card_label`: user-chosen nickname for the card (e.g. `"HDFC Platinum"`), max 100 characters. Stored and returned in cleartext so the frontend can show which card is being unlocked before the passkey is entered — see LLD §4.3.
 
 Example:
 
@@ -209,12 +208,13 @@ curl --request POST http://localhost:8080/create \
     "card_identifier": "550e8400-e29b-41d4-a716-446655440000",
     "encrypted_cc_blob": "AAECAwQFBgcICQ==",
     "srp_verifier": "a1b2c3d4",
-    "srp_salt": "e5f6a7b8",
-    "card_label": "HDFC Platinum"
+    "srp_salt": "e5f6a7b8"
   }'
 ```
 
 A successful request returns `200 OK` with no body. Invalid input returns `400 Bad Request`; duplicate card identifiers return `409 Conflict`.
+
+Because identifiers are derived, storing the same card name, last four digits, and passkey twice produces the same identifier and therefore a `409`. That is the intended signal for "you already stored this card" — it must not silently overwrite or no-op.
 
 ## Logging
 
@@ -237,9 +237,19 @@ The logging system intentionally **never logs:**
 - SRP proofs (M1, M2, session key S)
 - Encrypted CC blob contents
 - Decrypted plaintext card data
+- **Raw card identifiers**
+
+Card identifiers are derived from the passkey (LLD §4.3), so a log line carrying one lets anyone with the log file grind passkey guesses offline — no server, no rate limit, no lockout. Application code routes every identifier through `LogSafe.identifier(...)`, which emits a truncated SHA-256: still stable enough to correlate requests for attack detection, useless for grinding.
+
+Two framework loggers used to defeat this by logging around the application code, and are pinned in `logback-spring.xml` because of it:
+
+- `org.springframework...RequestResponseBodyMethodProcessor` at `DEBUG` prints the whole deserialized request body — identifier *and* ciphertext. Pinned to `INFO`.
+- `org.hibernate.type.descriptor.sql.BasicBinder` at `TRACE` prints every bound SQL parameter — identifier, verifier, salt, ciphertext. Removed.
+
+Do not re-enable either. `org.hibernate.SQL` at `DEBUG` is fine: statement text, no parameter values.
 
 Safe to log:
-- Card identifiers and labels
+- Hashed card identifiers (via `LogSafe`) and challenge IDs
 - Failed attempt counts and lockout state
 - Validation results and error types
 - Request/response metadata (size, timing)

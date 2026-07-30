@@ -19,6 +19,7 @@
  */
 import { beforeAll, describe, expect, it } from "vitest";
 
+import { deriveCardIdentifier, lastFourDigits } from "./cardIdentifier";
 import { decryptCard, encryptCard, type CardDetails } from "./cardCrypto";
 import { PBKDF2_ITERATIONS, SRP_HASH, SRP_SALT_BYTES } from "./constants";
 import { base64ToBytes, bigIntToHex, bytesToBase64, bytesToHex, hexToBigInt } from "./encoding";
@@ -81,6 +82,7 @@ describe("SRP parameters (offline)", () => {
 describe("AES-GCM round trip (offline)", () => {
   it("recovers the card and rejects a wrong passkey via the GCM tag", async () => {
     const details: CardDetails = {
+      label: "HDFC Platinum",
       cardNumber: "4111111111111111",
       expiry: "12/30",
       cvv: "123",
@@ -105,11 +107,20 @@ describe("backend availability", () => {
   });
 });
 
-/** Helper: store a card and return everything needed to unlock it. */
+/**
+ * Helper: store a card and return everything needed to unlock it. The identifier
+ * is derived exactly as the app derives it, so this exercises the real path
+ * rather than a random UUID the backend would accept either way.
+ */
 async function createCard(passkey: string, label: string, details: CardDetails) {
-  const cardIdentifier = crypto.randomUUID();
+  const stored: CardDetails = { ...details, label };
+  const cardIdentifier = await deriveCardIdentifier(
+    label,
+    lastFourDigits(stored.cardNumber),
+    passkey,
+  );
   const salt = generateSrpSalt();
-  const blob = await encryptCard(details, passkey, salt);
+  const blob = await encryptCard(stored, passkey, salt);
   const verifier = await computeVerifier(cardIdentifier, passkey, salt);
   const response = await fetch(`${BACKEND_URL}/create`, {
     method: "POST",
@@ -119,10 +130,9 @@ async function createCard(passkey: string, label: string, details: CardDetails) 
       encrypted_cc_blob: bytesToBase64(blob),
       srp_verifier: bigIntToHex(verifier),
       srp_salt: bytesToHex(salt),
-      card_label: label,
     }),
   });
-  return { cardIdentifier, salt, response };
+  return { cardIdentifier, salt, stored, response };
 }
 
 async function requestChallenge(cardIdentifier: string) {
@@ -159,6 +169,7 @@ if (!reachable) {
 
 liveDescribe("live handshake against the Java backend", () => {
   const details: CardDetails = {
+    label: "HDFC Platinum",
     cardNumber: "4111111111111111",
     expiry: "12/30",
     cvv: "123",
@@ -175,15 +186,21 @@ liveDescribe("live handshake against the Java backend", () => {
     "completes create -> challenge -> proof -> decrypt and verifies the server proof",
     async () => {
       const passkey = "interop-test-passkey";
-      const label = "Interop Test Card";
-      const { cardIdentifier, salt, response: created } = await createCard(passkey, label, details);
+      // Unique per run: the identifier is derived, so a fixed name would collide
+      // with the previous run's row against a database that persists.
+      const label = `Interop Test Card ${crypto.randomUUID()}`;
+      const {
+        cardIdentifier,
+        salt,
+        stored,
+        response: created,
+      } = await createCard(passkey, label, details);
       expect(created.status, await created.text()).toBe(200);
 
       const { response: challengeResponse, body: challenge } =
         await requestChallenge(cardIdentifier);
       expect(challengeResponse.status).toBe(200);
       expect(challenge.srp_salt).toBe(bytesToHex(salt));
-      expect(challenge.card_label).toBe(label);
 
       // Our M1 has to satisfy Nimbus's own computation on the other side.
       const proof = await computeProof(
@@ -209,9 +226,11 @@ liveDescribe("live handshake against the Java backend", () => {
         proof.session.step3(hexToBigInt(fetched.server_proof)),
       ).resolves.not.toThrow();
 
+      // The card's name comes back out of the ciphertext — there is no plaintext
+      // `card_label` column any more (V3).
       await expect(
         decryptCard(base64ToBytes(fetched.encrypted_cc_blob), passkey, salt),
-      ).resolves.toMatchObject(details);
+      ).resolves.toMatchObject(stored);
     },
     120_000,
   );
@@ -219,7 +238,11 @@ liveDescribe("live handshake against the Java backend", () => {
   it(
     "rejects a wrong passkey with 403 and returns no ciphertext",
     async () => {
-      const { cardIdentifier } = await createCard("the-right-one", "Interop Negative", details);
+      const { cardIdentifier } = await createCard(
+        "the-right-one",
+        `Interop Negative ${crypto.randomUUID()}`,
+        details,
+      );
       const { body: challenge } = await requestChallenge(cardIdentifier);
 
       const proof = await computeProof(
@@ -248,9 +271,12 @@ liveDescribe("live handshake against the Java backend", () => {
       expect(body).toHaveProperty("challenge_id");
       expect(body).toHaveProperty("srp_salt");
       expect(body).toHaveProperty("server_public_ephemeral");
-      // A fixed placeholder label, not an omitted field — same response shape.
-      expect(typeof body.card_label).toBe("string");
-      expect(body.card_label.length).toBeGreaterThan(0);
+      // Nothing in the response distinguishes this from a card that exists.
+      expect(Object.keys(body).sort()).toEqual([
+        "challenge_id",
+        "server_public_ephemeral",
+        "srp_salt",
+      ]);
     },
     60_000,
   );

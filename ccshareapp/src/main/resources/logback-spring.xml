@@ -36,11 +36,23 @@
     <!-- Spring Framework Loggers -->
     <logger name="org.springframework" level="INFO"/>
     <logger name="org.springframework.security" level="DEBUG"/>
-    <logger name="org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor" level="DEBUG"/>
+    <!--
+        RequestResponseBodyMethodProcessor at DEBUG prints the whole deserialized
+        request body. That means `card_identifier` and `encrypted_cc_blob` in the
+        clear on every /create — both of which LLD §6.7 forbids logging, and the
+        identifier is now derived from the passkey, so a log line carrying one is
+        an offline oracle for grinding it. Application code routes identifiers
+        through `LogSafe`; this logger bypassed that entirely. Keep it at INFO.
+    -->
+    <logger name="org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor" level="INFO"/>
 
     <!-- Hibernate/JPA Loggers -->
+    <!--
+        Statement text only. `BasicBinder` at TRACE was removed deliberately: it
+        logs every bound parameter, which on this schema is the identifier, the
+        SRP verifier, the salt, and the ciphertext (LLD §6.7 again).
+    -->
     <logger name="org.hibernate.SQL" level="DEBUG"/>
-    <logger name="org.hibernate.type.descriptor.sql.BasicBinder" level="TRACE"/>
 
     <!-- Third-party Libraries -->
     <logger name="com.zaxxer.hikari" level="INFO"/>

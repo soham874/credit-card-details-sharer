@@ -11,6 +11,7 @@ import {
   passesLuhn,
   ratePasskey,
 } from "../cardUtils";
+import { lastFourDigits, normalizeCardName } from "../crypto/cardIdentifier";
 import { MAX_CARD_LABEL_LENGTH } from "../crypto/constants";
 import { prepareCard } from "../crypto/cryptoClient";
 import type { CardDetails } from "../crypto/cardCrypto";
@@ -18,6 +19,7 @@ import { CardPreview } from "./CardPreview";
 import { PasskeyField } from "./PasskeyField";
 
 const EMPTY_DETAILS: CardDetails = {
+  label: "",
   cardNumber: "",
   expiry: "",
   cvv: "",
@@ -26,35 +28,41 @@ const EMPTY_DETAILS: CardDetails = {
   notes: "",
 };
 
-type Stage = "form" | "encrypting" | "saving" | "done";
+type Stage = "form" | "confirm" | "encrypting" | "saving" | "done";
+
+/** What the user has to be able to reproduce later. Nothing else can find the card. */
+type CardHandle = { cardName: string; last4: string };
 
 type Props = {
-  /** Hands the new identifier to the unlock flow so the user can test it immediately. */
-  onUnlockCard: (cardIdentifier: string) => void;
+  /** Hands the name and last four to the unlock flow so the user can test them immediately. */
+  onUnlockCard: (handle: CardHandle) => void;
 };
 
 export function CreateCardFlow({ onUnlockCard }: Props) {
   const [details, setDetails] = useState<CardDetails>(EMPTY_DETAILS);
-  const [cardLabel, setCardLabel] = useState("");
   const [passkey, setPasskey] = useState("");
   const [confirmPasskey, setConfirmPasskey] = useState("");
   const [stage, setStage] = useState<Stage>("form");
   const [error, setError] = useState<string | undefined>();
-  const [savedIdentifier, setSavedIdentifier] = useState<string | undefined>();
-  const [copied, setCopied] = useState(false);
+  const [savedHandle, setSavedHandle] = useState<CardHandle | undefined>();
 
   const brand = detectBrand(details.cardNumber);
   const busy = stage === "encrypting" || stage === "saving";
+  const normalizedName = normalizeCardName(details.label);
+  const last4 = lastFourDigits(details.cardNumber);
 
   function update<K extends keyof CardDetails>(key: K, value: CardDetails[K]) {
     setDetails((current) => ({ ...current, [key]: value }));
   }
 
   function validate(): string | undefined {
-    if (!cardLabel.trim()) return "Give the card a name so you can recognise it later.";
-    if (cardLabel.length > MAX_CARD_LABEL_LENGTH) {
+    if (!details.label.trim()) return "Give the card a name so you can find it later.";
+    if (details.label.length > MAX_CARD_LABEL_LENGTH) {
       return `Card name must be ${MAX_CARD_LABEL_LENGTH} characters or fewer.`;
     }
+    // Punctuation and spacing are stripped before the name is used, so a name
+    // made only of them would leave nothing to derive from.
+    if (!normalizedName) return "Card name must contain at least one letter or digit.";
     if (!passesLuhn(details.cardNumber)) return "That card number does not look valid.";
     if (!isExpiryValid(details.expiry)) return "Enter a valid, unexpired expiry date as MM/YY.";
     if (details.cvv.length !== brand.cvvLength) {
@@ -69,27 +77,32 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
     return undefined;
   }
 
-  async function handleSubmit(event: FormEvent) {
+  function handleReview(event: FormEvent) {
     event.preventDefault();
     const validationError = validate();
     if (validationError) {
       setError(validationError);
       return;
     }
+    setError(undefined);
+    setStage("confirm");
+  }
 
+  async function handleConfirmedSave() {
     setError(undefined);
     setStage("encrypting");
     try {
-      // Everything secret happens inside the worker: it returns only ciphertext,
-      // the one-way verifier, and the salt.
-      const request = await prepareCard(details, cardLabel.trim(), passkey);
+      // Everything secret happens inside the worker: it returns only the derived
+      // identifier, ciphertext, the one-way verifier, and the salt.
+      const request = await prepareCard(details, passkey);
 
       setStage("saving");
       await createCard(request);
 
-      setSavedIdentifier(request.card_identifier);
-      // Drop the plaintext and the passkey the moment they are no longer needed
-      // (LLD §8.2).
+      // The name and last four are kept for the hand-off to the unlock flow.
+      // Everything genuinely sensitive — the full number, CVV, PIN, passkey —
+      // goes now (LLD §8.2).
+      setSavedHandle({ cardName: details.label.trim(), last4 });
       setDetails(EMPTY_DETAILS);
       setPasskey("");
       setConfirmPasskey("");
@@ -97,32 +110,22 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
     } catch (caught) {
       setStage("form");
       setError(
-        caught instanceof ApiError || caught instanceof Error
-          ? caught.message
-          : "Something went wrong while saving the card.",
+        caught instanceof ApiError && caught.status === 409
+          ? "A card with this name, last four digits, and passkey is already stored. Unlock it instead, or use a different name."
+          : caught instanceof ApiError || caught instanceof Error
+            ? caught.message
+            : "Something went wrong while saving the card.",
       );
     }
   }
 
-  async function copyIdentifier() {
-    if (!savedIdentifier) return;
-    try {
-      await navigator.clipboard.writeText(savedIdentifier);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setError("Could not copy automatically — select the identifier and copy it manually.");
-    }
-  }
-
   function startAnother() {
-    setSavedIdentifier(undefined);
-    setCardLabel("");
+    setSavedHandle(undefined);
     setStage("form");
     setError(undefined);
   }
 
-  if (stage === "done" && savedIdentifier) {
+  if (stage === "done" && savedHandle) {
     return (
       <section className="panel">
         <div className="success-mark" aria-hidden="true">
@@ -135,17 +138,79 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
         </p>
 
         <div className="callout danger">
-          <strong>Save this identifier now.</strong> There is no account and no card list — this
-          identifier plus your passkey is the only way to get the card back. If you lose either, the
-          data is unrecoverable.
+          <strong>Remember these three things.</strong> They are not stored anywhere and they cannot
+          be recovered. Together they are the only way back to this card — nothing else, including
+          us, can find it.
         </div>
 
-        <div className="identifier-block">
-          <code className="identifier">{savedIdentifier}</code>
-          <button type="button" className="button secondary" onClick={copyIdentifier}>
-            {copied ? "Copied" : "Copy"}
+        <dl className="recall-list">
+          <div className="recall-item">
+            <dt>Card name</dt>
+            <dd>{savedHandle.cardName}</dd>
+          </div>
+          <div className="recall-item">
+            <dt>Last 4 digits</dt>
+            <dd className="mono">{savedHandle.last4}</dd>
+          </div>
+          <div className="recall-item">
+            <dt>Passkey</dt>
+            <dd className="muted">The one you just chose</dd>
+          </div>
+        </dl>
+
+        {error && <p className="error-text">{error}</p>}
+
+        <div className="button-row">
+          <button type="button" className="button" onClick={() => onUnlockCard(savedHandle)}>
+            Unlock it now
+          </button>
+          <button type="button" className="button secondary" onClick={startAnother}>
+            Store another card
           </button>
         </div>
+      </section>
+    );
+  }
+
+  if (stage === "confirm" || busy) {
+    return (
+      <section className="panel">
+        <h2>Check this before it is encrypted</h2>
+        <p className="lede">
+          Stored cards cannot be edited or deleted. If anything here is wrong, go back now — after
+          this, the only fix is storing the card again under a different name.
+        </p>
+
+        <div className="callout danger">
+          <strong>You will need all three of these to get this card back.</strong> Nothing is written
+          down for you, and there is no reset. Get one of them wrong later and the card is simply not
+          found.
+        </div>
+
+        <dl className="recall-list">
+          <div className="recall-item">
+            <dt>Card name</dt>
+            <dd>
+              {details.label.trim()}{" "}
+              <span className="muted">
+                (matched as <code>{normalizedName}</code>)
+              </span>
+            </dd>
+          </div>
+          <div className="recall-item">
+            <dt>Last 4 digits</dt>
+            <dd className="mono">{last4}</dd>
+          </div>
+          <div className="recall-item">
+            <dt>Passkey</dt>
+            <dd className="muted">The one you just chose</dd>
+          </div>
+        </dl>
+
+        <p className="field-hint">
+          Spacing, capitals, and punctuation in the name do not matter — <code>{normalizedName}</code>{" "}
+          is what has to match. The words themselves do.
+        </p>
 
         {error && <p className="error-text">{error}</p>}
 
@@ -153,14 +218,30 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
           <button
             type="button"
             className="button"
-            onClick={() => onUnlockCard(savedIdentifier)}
+            onClick={() => void handleConfirmedSave()}
+            disabled={busy}
           >
-            Unlock it now
+            {stage === "encrypting"
+              ? "Encrypting in your browser…"
+              : stage === "saving"
+                ? "Storing ciphertext…"
+                : "Encrypt and store"}
           </button>
-          <button type="button" className="button secondary" onClick={startAnother}>
-            Store another card
+          <button
+            type="button"
+            className="button secondary"
+            onClick={() => setStage("form")}
+            disabled={busy}
+          >
+            Back to edit
           </button>
         </div>
+        {busy && (
+          <p className="field-hint center">
+            Key derivation is deliberately slow, and this runs it twice — once for the card's
+            identifier and once for its encryption key. It takes a moment by design.
+          </p>
+        )}
       </section>
     );
   }
@@ -178,10 +259,10 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
         holder={details.holder}
         expiry={details.expiry}
         cvv={details.cvv}
-        label={cardLabel}
+        label={details.label}
       />
 
-      <form onSubmit={handleSubmit} noValidate>
+      <form onSubmit={handleReview} noValidate>
         <div className="field">
           <label className="field-label" htmlFor="card-label">
             Card name
@@ -189,15 +270,21 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
           <input
             id="card-label"
             className="input"
-            value={cardLabel}
-            onChange={(event) => setCardLabel(event.target.value.slice(0, MAX_CARD_LABEL_LENGTH))}
+            value={details.label}
+            onChange={(event) => update("label", event.target.value.slice(0, MAX_CARD_LABEL_LENGTH))}
             placeholder="HDFC Platinum"
             autoComplete="off"
             disabled={busy}
           />
           <p className="field-hint">
-            Stored unencrypted so you can tell which card you are unlocking before you type the
-            passkey. Never put card data in here.
+            {normalizedName ? (
+              <>
+                You will find this card again by its name, its last 4 digits, and your passkey. This
+                one will be matched as <code>{normalizedName}</code>.
+              </>
+            ) : (
+              "You will find this card again by its name, its last 4 digits, and your passkey — so pick something you will still say the same way in a year."
+            )}
           </p>
         </div>
 
@@ -310,7 +397,7 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
           onChange={setPasskey}
           showStrength
           disabled={busy}
-          hint="Never sent to the server. Never recoverable. Write it down somewhere safe."
+          hint="Never sent to the server. Never recoverable. It is what keeps this card unreachable, so make it a real one."
         />
         <PasskeyField
           label="Confirm passkey"
@@ -322,17 +409,8 @@ export function CreateCardFlow({ onUnlockCard }: Props) {
         {error && <p className="error-text">{error}</p>}
 
         <button type="submit" className="button full" disabled={busy}>
-          {stage === "encrypting"
-            ? "Encrypting in your browser…"
-            : stage === "saving"
-              ? "Storing ciphertext…"
-              : "Encrypt and store"}
+          Review and store
         </button>
-        {busy && (
-          <p className="field-hint center">
-            Key derivation is deliberately slow — this takes a moment by design.
-          </p>
-        )}
       </form>
     </section>
   );

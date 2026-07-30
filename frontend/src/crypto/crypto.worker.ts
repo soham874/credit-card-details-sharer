@@ -8,9 +8,10 @@
  *  2. PBKDF2 at 600k iterations plus 2048-bit modular exponentiation would
  *     otherwise freeze the page for seconds.
  *
- * The passkey enters on `create`/`prove` and is wiped on completion. It is
+ * The passkey enters on `create`/`beginUnlock` and is wiped on completion. It is
  * never returned to the UI thread and never persisted anywhere.
  */
+import { deriveCardIdentifier, lastFourDigits } from "./cardIdentifier";
 import { encryptCard, decryptCard } from "./cardCrypto";
 import { MAX_CARD_LABEL_LENGTH } from "./constants";
 import { base64ToBytes, bigIntToHex, bytesToBase64, bytesToHex, hexToBytes } from "./encoding";
@@ -19,38 +20,51 @@ import type { SrpProof } from "./srp";
 import type { WorkerRequest, WorkerResponse } from "./workerProtocol";
 
 /**
- * SRP state held between the two `/fetch` round trips. Lives only for the
- * duration of one unlock; `unseal` and `discard` both clear it.
+ * State for one unlock, from `beginUnlock` through `unseal`. The passkey is held
+ * here rather than on the UI thread precisely because it is needed twice: once
+ * to answer the server's challenge and once to decrypt what comes back.
  */
 type PendingUnlock = {
+  cardIdentifier: string;
   passkey: string;
-  saltHex: string;
-  session: SrpProof["session"];
+  saltHex?: string;
+  session?: SrpProof["session"];
 };
 
 const pendingUnlocks = new Map<number, PendingUnlock>();
 
-function forget(proveId: number): void {
-  pendingUnlocks.delete(proveId);
+function forget(unlockId: number): void {
+  pendingUnlocks.delete(unlockId);
+}
+
+function requireUnlock(unlockId: number): PendingUnlock {
+  const pending = pendingUnlocks.get(unlockId);
+  if (!pending) {
+    throw new Error("This unlock session has expired. Start again.");
+  }
+  return pending;
 }
 
 async function handle(request: WorkerRequest): Promise<unknown> {
   switch (request.type) {
     case "create": {
-      const cardLabel = request.cardLabel.trim();
-      if (!cardLabel || cardLabel.length > MAX_CARD_LABEL_LENGTH) {
+      const label = request.details.label.trim();
+      if (!label || label.length > MAX_CARD_LABEL_LENGTH) {
         throw new Error(`Card name must be 1-${MAX_CARD_LABEL_LENGTH} characters.`);
       }
 
-      // LLD §6.5 wants a server-issued identifier; the deployed `/create` takes
-      // a client-supplied UUIDv4 and validates its version/variant, so we mint
-      // one from the platform CSPRNG (122 bits of randomness).
-      const cardIdentifier = crypto.randomUUID();
+      const last4 = lastFourDigits(request.details.cardNumber);
+      const details = { ...request.details, label };
       const salt = generateSrpSalt();
 
-      // Same salt feeds both the AES key derivation and the SRP verifier, as in
-      // the backend's own integration test.
-      const blob = await encryptCard(request.details, request.passkey, salt);
+      // Independent derivations, so let the platform overlap them — this is the
+      // slowest thing the app does and it now runs PBKDF2 twice.
+      const [cardIdentifier, blob] = await Promise.all([
+        deriveCardIdentifier(label, last4, request.passkey),
+        // Same salt feeds both the AES key derivation and the SRP verifier, as
+        // in the backend's own integration test.
+        encryptCard(details, request.passkey, salt),
+      ]);
       const verifier = await computeVerifier(cardIdentifier, request.passkey, salt);
 
       return {
@@ -58,22 +72,29 @@ async function handle(request: WorkerRequest): Promise<unknown> {
         encrypted_cc_blob: bytesToBase64(blob),
         srp_verifier: bigIntToHex(verifier),
         srp_salt: bytesToHex(salt),
-        card_label: cardLabel,
       };
     }
 
-    case "prove": {
-      const proof = await computeProof(
-        request.cardIdentifier,
+    case "beginUnlock": {
+      const cardIdentifier = await deriveCardIdentifier(
+        request.cardName,
+        request.last4,
         request.passkey,
+      );
+      pendingUnlocks.set(request.id, { cardIdentifier, passkey: request.passkey });
+      return { cardIdentifier };
+    }
+
+    case "prove": {
+      const pending = requireUnlock(request.unlockId);
+      const proof = await computeProof(
+        pending.cardIdentifier,
+        pending.passkey,
         request.saltHex,
         request.serverPublicEphemeralHex,
       );
-      pendingUnlocks.set(request.id, {
-        passkey: request.passkey,
-        saltHex: request.saltHex,
-        session: proof.session,
-      });
+      pending.saltHex = request.saltHex;
+      pending.session = proof.session;
       return {
         clientPublicEphemeral: proof.clientPublicEphemeral,
         clientProof: proof.clientProof,
@@ -81,8 +102,8 @@ async function handle(request: WorkerRequest): Promise<unknown> {
     }
 
     case "unseal": {
-      const pending = pendingUnlocks.get(request.proveId);
-      if (!pending) {
+      const pending = requireUnlock(request.unlockId);
+      if (!pending.session || !pending.saltHex) {
         throw new Error("This unlock session has expired. Start again.");
       }
       try {
@@ -96,12 +117,12 @@ async function handle(request: WorkerRequest): Promise<unknown> {
           hexToBytes(pending.saltHex),
         );
       } finally {
-        forget(request.proveId);
+        forget(request.unlockId);
       }
     }
 
     case "discard": {
-      forget(request.proveId);
+      forget(request.unlockId);
       return undefined;
     }
   }

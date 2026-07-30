@@ -21,15 +21,14 @@ The **ephemeral storage** (public keys, share payloads, SRP challenges) is inten
 
 ## 2. `cards`
 
-Primary record store. Backend never decrypts or derives anything from this table — it's a blind store keyed by a high-entropy, server-generated identifier.
+Primary record store. Backend never decrypts or derives anything from this table — it's a blind store keyed by an identifier the browser derives from the card name, its last four digits, and the passkey (LLD §4.3).
 
 | Field | MySQL Type | Constraints | Notes |
 |---|---|---|---|
-| `card_identifier` | `CHAR(36)` | `PRIMARY KEY` | UUIDv4 (or 128-bit random token). Server-generated only (LLD §6.5) — never accept a client-supplied value as PK. Must not be sequential or guessable. |
-| `encrypted_cc_blob` | `VARBINARY(512)` | `NOT NULL` | IV \|\| ciphertext \|\| AEAD tag, raw bytes. Sized generously for AES-256-GCM overhead on card-sized plaintext. |
+| `card_identifier` | `CHAR(36)` | `PRIMARY KEY` | UUIDv4 shape, **derived client-side** from the card name, its last four digits, and the passkey (LLD §4.3). Client-supplied by necessity — the server cannot compute it, since it never sees the passkey. Treat as secret-adjacent: it is an offline oracle for grinding the passkey behind it, so it must not be logged in the clear (LLD §6.7). |
+| `encrypted_cc_blob` | `VARBINARY(512)` | `NOT NULL` | IV \|\| ciphertext \|\| AEAD tag, raw bytes. Sized generously for AES-256-GCM overhead on card-sized plaintext. Also carries the card's nickname, since `card_label` was dropped. |
 | `srp_verifier` | `VARCHAR(512)` | `NOT NULL` | Hex string; sized for a 2048-bit+ SRP group. |
 | `srp_salt` | `VARCHAR(64)` | `NOT NULL` | Hex, fixed length per KDF config. |
-| `card_label` | `VARCHAR(100)` | `NOT NULL` | Plaintext, user-chosen nickname (e.g. "HDFC Platinum"). Lets the frontend show which card is being unlocked before the passkey is entered — there's no account/listing concept to browse cards any other way. Safe to store unencrypted: it's a name the user typed, never derived from card data, and no more revealing than the fact that the row exists (LLD §4.3). |
 | `created_at` | `TIMESTAMP` | `NOT NULL DEFAULT CURRENT_TIMESTAMP` | |
 | `failed_attempt_count` | `SMALLINT UNSIGNED` | `NOT NULL DEFAULT 0` | Shared counter across `/fetch` and `/share/authLink` (LLD §6.4). Reset to 0 on successful proof. |
 | `locked_until` | `TIMESTAMP` | `NULL DEFAULT NULL` | Lockout expiry. `NULL` = not locked. Lives on the record itself so lockout state survives restarts of any rate-limiting middleware. |
@@ -38,13 +37,14 @@ Primary record store. Backend never decrypts or derives anything from this table
 
 **Immutability:** rows are never updated except `failed_attempt_count` and `locked_until` (auth-attempt bookkeeping), and never deleted under normal operation — this system has no expressed card-deletion/expiry flow today.
 
+**Inserts must be inserts.** Because the PK is client-assigned, an ORM that decides newness by "is the id null?" will treat every `/create` as an update to an existing row. Every payload column above is immutable, so such an update writes nothing and reports success — silently discarding the caller's data. Harmless while identifiers were random and never collided; with derived identifiers (LLD §4.3), storing the same card twice is an ordinary user action and must return `409`. The JPA entity declares `Persistable` for exactly this reason.
+
 ```sql
 CREATE TABLE cards (
     card_identifier      CHAR(36)            NOT NULL,
     encrypted_cc_blob    VARBINARY(512)      NOT NULL,
     srp_verifier         VARCHAR(512)        NOT NULL,
     srp_salt             VARCHAR(64)         NOT NULL,
-    card_label           VARCHAR(100)        NOT NULL,
     created_at           TIMESTAMP           NOT NULL DEFAULT CURRENT_TIMESTAMP,
     failed_attempt_count SMALLINT UNSIGNED   NOT NULL DEFAULT 0,
     locked_until          TIMESTAMP           NULL DEFAULT NULL,
@@ -52,7 +52,9 @@ CREATE TABLE cards (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 ```
 
-**Migration note (`V2__add_card_label.sql`):** adds `card_label` to an existing `cards` table via `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ''`, then drops the default. This is a POC-stage convenience — there is no production data to backfill — and lets the column land as `NOT NULL` without a separate backfill step.
+**Migration note (`V2__add_card_label.sql`):** added `card_label` via `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT ''`, then dropped the default — a POC-stage convenience that let the column land as `NOT NULL` without a backfill step.
+
+**Migration note (`V3__drop_card_label.sql`):** drops it again. The column existed so `/fetch` step 1 could name the card before the passkey was entered; users now type that name themselves to derive the identifier (LLD §4.3), so the plaintext copy answered nothing and leaked every nickname to anyone with database access. The name moved into `encrypted_cc_blob`. V2 is kept rather than rewritten so existing databases migrate forward cleanly.
 
 > `utf8mb4_bin` over `utf8mb4_unicode_ci`: identifiers and hex/binary fields need exact byte-equality comparisons, not linguistic sorting. A case-insensitive collation could quietly treat two distinct identifiers as equal.
 
@@ -65,7 +67,7 @@ Append-only log satisfying LLD §6.7 ("do log: failed-attempt counts, lockout tr
 | Field | MySQL Type | Constraints | Notes |
 |---|---|---|---|
 | `event_id` | `BIGINT UNSIGNED` | `PRIMARY KEY AUTO_INCREMENT` | Monotonic, cheap, sufficient — no need for UUID here since this is an internal-only log, never exposed via API. |
-| `card_identifier` | `CHAR(36)` | `NOT NULL` | Deliberately **no foreign key** to `cards.card_identifier`. Keeps this table writable/insertable even if it's later moved to a separate log store or physically different database; also means a lookup-miss event (LLD §6.3, an identifier that doesn't exist) can still be logged. |
+| `card_identifier` | `CHAR(36)` | `NOT NULL` | Deliberately **no foreign key** to `cards.card_identifier`. Keeps this table writable/insertable even if it's later moved to a separate log store or physically different database; also means a lookup-miss event (LLD §6.3, an identifier that doesn't exist) can still be logged. **Store a truncated SHA-256 of the identifier, not the raw value** — identifiers are derived from the passkey (LLD §4.3), so a retained audit trail of raw identifiers is a retained set of offline grinding oracles. Hashing preserves the only property this table needs from the column: equality, for correlating attempts. |
 | `event_type` | `ENUM('fetch_fail','fetch_success','authlink_fail','authlink_success','lockout_triggered')` | `NOT NULL` | Covers both `/fetch` and `/share/authLink` per the shared failure budget (LLD §6.4). Extend the enum as new flows are added rather than using a free-text column — keeps the event vocabulary closed and query-friendly. |
 | `occurred_at` | `TIMESTAMP(3)` | `NOT NULL DEFAULT CURRENT_TIMESTAMP(3)` | Millisecond precision — useful for reconstructing rapid-fire brute-force attempt sequences. |
 | `client_ip_hash` | `CHAR(64)` | `NULL` | SHA-256 hex digest of the client IP (+ salt), **not the raw IP**. Enables correlating repeated attempts from the same source without storing directly identifying network data at rest. Nullable in case IP isn't available in some deployment context (e.g. behind a proxy that strips it). |

@@ -4,7 +4,12 @@
  */
 import type { CreateCardRequest } from "../api/cardApi";
 import type { CardDetails } from "./cardCrypto";
-import type { ProveResult, WorkerRequest, WorkerResponse } from "./workerProtocol";
+import type {
+  BeginUnlockResult,
+  ProveResult,
+  WorkerRequest,
+  WorkerResponse,
+} from "./workerProtocol";
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -45,7 +50,8 @@ function ensureWorker(): Worker {
 
 /**
  * Assigns the request id and hands it back alongside the promise, because the
- * unlock flow needs the id of its `prove` call to reach the retained session.
+ * unlock flow needs the id of its `beginUnlock` call to reach the retained
+ * session.
  */
 function dispatch<T>(build: (id: number) => WorkerRequest): { id: number; result: Promise<T> } {
   const id = nextRequestId++;
@@ -57,64 +63,76 @@ function dispatch<T>(build: (id: number) => WorkerRequest): { id: number; result
 }
 
 /**
- * Encrypt the card and derive the verifier. Returns exactly the `/create` body;
- * neither the passkey nor the plaintext leaves the worker.
+ * Derive the identifier, encrypt the card, and derive the verifier. Returns
+ * exactly the `/create` body; neither the passkey nor the plaintext leaves the
+ * worker.
  */
-export function prepareCard(
-  details: CardDetails,
-  cardLabel: string,
-  passkey: string,
-): Promise<CreateCardRequest> {
+export function prepareCard(details: CardDetails, passkey: string): Promise<CreateCardRequest> {
   return dispatch<CreateCardRequest>((id) => ({
     id,
     type: "create",
     details,
-    cardLabel,
     passkey,
   })).result;
 }
 
-export type ProveHandle = ProveResult & {
-  /** Pass to `unsealCard`/`discardUnlock` to reach this call's retained session. */
-  proveId: number;
+export type UnlockHandle = BeginUnlockResult & {
+  /** Pass to `proveUnlock`/`unsealCard`/`discardUnlock` to reach this unlock's session. */
+  unlockId: number;
 };
 
-/** Answer the server's SRP challenge. The worker keeps the session for `unsealCard`. */
-export async function proveUnlock(
-  cardIdentifier: string,
+/**
+ * Derives the card identifier and parks the passkey in the worker. Once this
+ * resolves the UI thread has no further use for the passkey and should clear it.
+ */
+export async function beginUnlock(
+  cardName: string,
+  last4: string,
   passkey: string,
+): Promise<UnlockHandle> {
+  const { id, result } = dispatch<BeginUnlockResult>((requestId) => ({
+    id: requestId,
+    type: "beginUnlock",
+    cardName,
+    last4,
+    passkey,
+  }));
+  return { ...(await result), unlockId: id };
+}
+
+/** Answer the server's SRP challenge using the passkey the worker already holds. */
+export function proveUnlock(
+  unlockId: number,
   saltHex: string,
   serverPublicEphemeralHex: string,
-): Promise<ProveHandle> {
-  const { id, result } = dispatch<ProveResult>((requestId) => ({
-    id: requestId,
+): Promise<ProveResult> {
+  return dispatch<ProveResult>((id) => ({
+    id,
     type: "prove",
-    cardIdentifier,
-    passkey,
+    unlockId,
     saltHex,
     serverPublicEphemeralHex,
-  }));
-  return { ...(await result), proveId: id };
+  })).result;
 }
 
 /** Verify the server's `M2`, then decrypt. Clears the retained session either way. */
 export function unsealCard(
-  proveId: number,
+  unlockId: number,
   blobBase64: string,
   serverProofHex: string,
 ): Promise<CardDetails> {
   return dispatch<CardDetails>((id) => ({
     id,
     type: "unseal",
-    proveId,
+    unlockId,
     blobBase64,
     serverProofHex,
   })).result;
 }
 
 /** Drop a retained session when an unlock is abandoned or the server refuses the proof. */
-export function discardUnlock(proveId: number): void {
-  void dispatch<void>((id) => ({ id, type: "discard", proveId })).result.catch(() => {
+export function discardUnlock(unlockId: number): void {
+  void dispatch<void>((id) => ({ id, type: "discard", unlockId })).result.catch(() => {
     // Nothing to recover: the state we wanted gone is gone either way.
   });
 }

@@ -1,48 +1,33 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { CreateCardFlow } from "./components/CreateCardFlow";
 import { UnlockCardFlow } from "./components/UnlockCardFlow";
-import { isUuidV4 } from "./cardUtils";
 
 type Tab = "create" | "unlock";
 
+type CardHandle = { cardName: string; last4: string };
+
 /**
- * Reads `#/unlock/<card-identifier>` so a stored card can be reached by link.
- * The identifier is not a secret on its own — the passkey is what protects the
- * data (LLD §4.3) — but it is still only ever put in the fragment, which
- * browsers do not send to the server.
+ * There is deliberately no `#/unlock/<identifier>` deep link any more.
+ *
+ * Identifiers are derived from the passkey now, which makes a leaked one an
+ * offline oracle for guessing that passkey — no server, no rate limit, unlimited
+ * attempts. A link would put exactly that into browser history and into whatever
+ * the link was pasted into. It would also be pointless: the identifier is
+ * recomputed from what the user knows, so there is nothing to link to.
  */
-function readIdentifierFromHash(): string | undefined {
-  const match = /^#\/unlock\/([0-9a-fA-F-]{36})$/.exec(window.location.hash);
-  return match && isUuidV4(match[1]) ? match[1] : undefined;
-}
-
 export function App() {
-  const [tab, setTab] = useState<Tab>(() => (readIdentifierFromHash() ? "unlock" : "create"));
-  const [identifierToUnlock, setIdentifierToUnlock] = useState<string | undefined>(
-    readIdentifierFromHash,
-  );
+  const [tab, setTab] = useState<Tab>("create");
+  const [handleToUnlock, setHandleToUnlock] = useState<CardHandle | undefined>();
 
-  useEffect(() => {
-    function onHashChange() {
-      const identifier = readIdentifierFromHash();
-      if (identifier) {
-        setIdentifierToUnlock(identifier);
-        setTab("unlock");
-      }
-    }
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
-
-  function openUnlock(cardIdentifier: string) {
-    setIdentifierToUnlock(cardIdentifier);
+  function openUnlock(handle: CardHandle) {
+    setHandleToUnlock(handle);
     setTab("unlock");
   }
 
   function switchTab(next: Tab) {
     setTab(next);
-    if (next === "create") setIdentifierToUnlock(undefined);
+    if (next === "create") setHandleToUnlock(undefined);
   }
 
   return (
@@ -82,7 +67,7 @@ export function App() {
         {tab === "create" ? (
           <CreateCardFlow onUnlockCard={openUnlock} />
         ) : (
-          <UnlockCardFlow initialIdentifier={identifierToUnlock} />
+          <UnlockCardFlow initialHandle={handleToUnlock} />
         )}
       </main>
 

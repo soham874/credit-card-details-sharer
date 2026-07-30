@@ -29,6 +29,19 @@ export const SRP_SALT_BYTES = 16;
 export const PBKDF2_ITERATIONS = 600_000;
 export const PBKDF2_HASH = "SHA-256" as const;
 
+/**
+ * Salt-space tag for the card-identifier derivation (`cardIdentifier.ts`).
+ *
+ * Two jobs. It separates that derivation from the AES one, which is salted with
+ * the random per-record `srp_salt`, so the two can never collide. And it version
+ * -stamps the normalization rules: if `normalizeCardName` ever has to change,
+ * bumping this tag is what lets old and new identifiers coexist instead of every
+ * stored card silently becoming unreachable.
+ *
+ * Do not change either the tag or the normalization without the other.
+ */
+export const ID_DERIVATION_VERSION = "ccshare-id-v1";
+
 /** AES-256-GCM. IV is 12 bytes and never reused: a fresh one is drawn per encryption. */
 export const AES_KEY_BITS = 256;
 export const AES_GCM_IV_BYTES = 12;
@@ -42,15 +55,25 @@ export const MAX_ENCRYPTED_BLOB_BYTES = 512;
 export const MAX_PLAINTEXT_BYTES =
   MAX_ENCRYPTED_BLOB_BYTES - AES_GCM_IV_BYTES - AES_GCM_TAG_BITS / 8;
 
-/** Backend caps `card_label` at 100 chars (`CreateCardRequest`, DB `VARCHAR(100)`). */
+/**
+ * The card's name. No longer a backend concern — the `card_label` column was
+ * dropped in V3 and the name now travels inside `encrypted_cc_blob` — so this
+ * cap exists to keep the encrypted payload inside `MAX_PLAINTEXT_BYTES` and to
+ * keep the name short enough to retype from memory.
+ */
 export const MAX_CARD_LABEL_LENGTH = 100;
 
-/** Server-side challenge TTL (`CardFetchService.CHALLENGE_TTL`). Surfaced so the UI can warn before it lapses. */
-export const CHALLENGE_TTL_SECONDS = 120;
-
-/** Lockout policy mirrored from `CardFetchService`, for messaging only — the backend is the enforcer. */
-export const MAX_FAILED_ATTEMPTS = 5;
-export const LOCKOUT_MINUTES = 15;
+/**
+ * The server's 2-minute challenge TTL and its 5-attempt/15-minute lockout used
+ * to be mirrored here so the unlock UI could count down and explain a lockout.
+ * Neither is surfaced any more:
+ *
+ *  - The passkey is collected before the challenge is requested, so the two
+ *    round trips complete in one go and the TTL cannot lapse mid-flow.
+ *  - A wrong passkey now derives the identifier of a card that does not exist,
+ *    so it never reaches the real card's counter. The lockout no longer bounds
+ *    online guessing and there is nothing honest to tell the user about it.
+ */
 
 /** How long decrypted card data is allowed to sit in the DOM before it is wiped (LLD §8.2). */
 export const PLAINTEXT_DWELL_SECONDS = 90;
