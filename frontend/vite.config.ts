@@ -65,8 +65,16 @@ export default defineConfig(() => {
   // Same-origin ('/api') needs nothing extra in connect-src beyond 'self'.
   const apiBaseUrl = process.env.VITE_API_BASE_URL ?? "";
   const apiOrigin = apiBaseUrl.startsWith("http") ? new URL(apiBaseUrl).origin : "";
+  /**
+   * A GitHub Pages *project* site is served from `/<repo>/`, not from the domain
+   * root, so every asset URL has to carry that prefix. Kept as an env var rather
+   * than hardcoded so local dev, `vite preview`, and a future custom domain all
+   * keep the default `/`.
+   */
+  const base = process.env.BASE_PATH ?? "/";
 
   return {
+    base,
     plugins: [react(), strictCsp(apiOrigin)],
     resolve: {
       alias: { crypto: nodeCryptoShim },

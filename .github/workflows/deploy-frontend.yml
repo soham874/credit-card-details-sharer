@@ -1,0 +1,75 @@
+# Builds the SPA and publishes it to GitHub Pages.
+#
+# Pages gives the frontend its own origin (github.io), separate from the API —
+# which LLD §8.1 requires as a security boundary, not a convenience. Two things
+# follow from that and must be configured outside this file:
+#   * repository variable `VITE_API_BASE_URL` — the API's own origin. Without it
+#     the build falls back to the relative `/api` used by the dev proxy, which
+#     does not exist on Pages, and every request 404s.
+#   * the backend's CORS allowlist must contain exactly this site's origin.
+name: Deploy frontend to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-frontend.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deployments race. `cancel-in-progress: false` so an in-flight
+# publish finishes rather than leaving the site half-updated.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: frontend
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      # Offline layer only — the live SRP interop layer self-skips without a
+      # reachable backend (see src/crypto/srp.interop.test.ts).
+      - run: npm test
+
+      - name: Build
+        env:
+          # A project site is served from /<repo>/, so assets need that prefix.
+          BASE_PATH: /${{ github.event.repository.name }}/
+          # Also widens the injected CSP's connect-src to this origin.
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,3 +1,9 @@
+app:
+  cors:
+    # Dev default: the Vite dev server. Overridden per-environment — see
+    # application-prod.yaml for the deployed origin.
+    allowed-origin: http://localhost:5173
+
 spring:
   application:
     name: ccshareapp
