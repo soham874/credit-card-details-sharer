@@ -1,8 +1,9 @@
 # -> /etc/systemd/system/ccshareapp.service
 [Unit]
 Description=Card Vault API
-# Naming both is harmless — ordering against a unit that does not exist is a no-op.
-After=network-online.target mysql.service mariadb.service
+# The database is a managed HeatWave DB System reached over the VCN, so there is
+# no local mysqld to order against — only the network.
+After=network-online.target
 Wants=network-online.target
 
 [Service]

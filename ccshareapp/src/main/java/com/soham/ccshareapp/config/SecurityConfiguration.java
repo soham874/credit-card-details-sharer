@@ -2,12 +2,15 @@ package com.soham.ccshareapp.config;
 
 import java.util.List;
 
+import jakarta.servlet.DispatcherType;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
@@ -24,7 +27,22 @@ public class SecurityConfiguration {
                 // answered there and never reaches the denyAll() at the bottom.
                 .cors(Customizer.withDefaults())
                 .csrf(csrf -> csrf.disable())
+                // Nothing here is authenticated and the frontend sends
+                // `credentials: "omit"`, so a session is pure overhead — and one
+                // was being minted per rejected request, which on a 1GB box is a
+                // slow memory leak an unauthenticated caller controls.
+                .sessionManagement(session -> session
+                        .sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(authorize -> authorize
+                        // A ResponseStatusException leaves the controller, Spring
+                        // forwards to /error, and that forward re-enters this
+                        // chain as a fresh ERROR dispatch. Without this line it
+                        // lands on denyAll() below and every 400/409/500 reaches
+                        // the client as an empty 403 — LLD §6.3 wants 403 to mean
+                        // one specific thing, not "some error happened".
+                        // MockMvc does not perform error dispatches, so the
+                        // integration tests cannot catch this regressing.
+                        .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         .requestMatchers(HttpMethod.POST, "/create", "/fetch").permitAll()
                         .requestMatchers("/swagger-ui/**", "/swagger-ui.html", "/v3/api-docs/**").permitAll()
                         .anyRequest().denyAll())

@@ -21,7 +21,13 @@ app:
 
 spring:
   datasource:
-    url: jdbc:mysql://127.0.0.1:3306/ccshareapp?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+    # DB_HOST is the HeatWave DB System's private endpoint inside the VCN — not
+    # loopback. sslMode=REQUIRED because HeatWave serves TLS and Connector/J
+    # would otherwise happily fall back to plaintext; `useSSL` is the deprecated
+    # spelling and is ignored by Connector/J 8+. No allowPublicKeyRetrieval:
+    # that only exists to shuttle caching_sha2 keys over an unencrypted link,
+    # which is exactly what we are refusing to do.
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT:3306}/ccshareapp?sslMode=REQUIRED&serverTimezone=UTC
     username: ${DB_USER}
     password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
@@ -59,3 +65,8 @@ logging:
     com.soham.ccshareapp: INFO
     org.springframework.security: WARN
     org.springframework.web: WARN
+    # logback-spring.xml pins org.hibernate.SQL to DEBUG outside its <springProfile>
+    # blocks, so the prod block's root=WARN does not reach it — an explicit logger
+    # level always beats root. That is one disk write per query, against a 1GB
+    # log cap on a shared box, and it buries the entries worth reading.
+    org.hibernate.SQL: WARN
