@@ -6,6 +6,15 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "frontend"],
       "port": 5173
+    },
+    {
+      "name": "frontend-against-deployed-api",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "BACKEND_URL=https://soham.dedyn.io npm run dev --prefix frontend"
+      ],
+      "port": 5173
     }
   ]
 }
